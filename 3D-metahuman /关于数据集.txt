@@ -1,2 +1,6 @@
 语音驱动表情的数据集
 https://github.com/TimoBolkart/voca
+
+
+arkit的blendeShape
+https://github.com/vasiliskatr/deformation_transfer_ARkit_blendshapes/tree/main/data/ARKit_blendShapes
