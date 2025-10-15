@@ -1,1 +1,5 @@
 https://github.com/SMUELDigital/Houdini-ARKit-52-FaceGen
+https://zhuanlan.zhihu.com/p/436866934
+
+修复
+https://www.bilibili.com/video/BV1FY4y1d75a/?vd_source=89db475a085d6a39d2dc35e7290740ed
