@@ -17,5 +17,6 @@ https://www.bilibili.com/video/BV1txTTzPEjc/?vd_source=89db475a085d6a39d2dc35e72
 https://www.bilibili.com/video/BV14wc3eNE6K/?vd_source=89db475a085d6a39d2dc35e7290740ed
 
 
-博客
+博客--
+人体姿态估计
 https://coding-x.tech/docs/parametricdesigncoding/02_pythonscript/toolconstruction/2-7-4_humanposeestimationnspatialpattern/
