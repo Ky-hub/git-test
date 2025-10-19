@@ -49,7 +49,12 @@ def generate_bone_rotations(bone_list, bone_limits, step, mode="all", sample_cou
     else:
         raise ValueError(f"未知模式: {mode}, 应为 'all' | 'sample'")
 
-
+def save_combinations_to_json(combinations, file_path):
+    """
+    保存角度组合为 JSON 文件
+    """
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(combinations, f, indent=4)
 
 if __name__ == "__main__":
     bone_list = ["head", "neck", "jaw", "eye"]
