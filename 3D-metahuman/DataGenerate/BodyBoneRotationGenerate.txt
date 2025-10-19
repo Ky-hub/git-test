@@ -1,1 +1,73 @@
+import numpy as np
+import itertools
+import random
+
+def generate_bone_rotations(bone_list, bone_limits, step, mode="all", sample_count=1000):
+    """
+    根据骨骼旋转范围与步长生成组合（只支持 'all' 和 'sample' 模式）。
+    
+    Args:
+        bone_list (list[str]): 骨骼名称列表。
+        bone_limits (dict[str, list|tuple|float|int]): 每个骨骼的旋转范围或固定值。
+        step (float): 步长。
+        mode (str): 'all' | 'sample'
+        sample_count (int): 仅在 'sample' 模式下生效。
+    
+    Returns:
+        list[list[float]]: 所有角度组合或随机采样组合。
+    """
+    
+    # 1️⃣ 生成每个骨骼的角度序列
+    angle_ranges = []
+    for bone in bone_list:
+        if bone not in bone_limits:
+            angles = [0.0]
+        else:
+            limit = bone_limits[bone]
+            if isinstance(limit, (int, float)):
+                angles = [float(limit)]
+            elif len(limit) == 2 and limit[0] == limit[1]:
+                angles = [float(limit[0])]
+            else:
+                min_val, max_val = limit
+                angles = [round(a, 6) for a in np.arange(min_val, max_val + step, step)]
+        angle_ranges.append(angles)
+
+    # 2️⃣ 模式选择
+    if mode == "all":
+        # 生成所有组合（完整笛卡尔积）
+        return [list(combo) for combo in itertools.product(*angle_ranges)]
+    
+    elif mode == "sample":
+        # 随机采样组合
+        combos = []
+        for _ in range(sample_count):
+            combo = [random.choice(angles) for angles in angle_ranges]
+            combos.append(combo)
+        return combos
+
+    else:
+        raise ValueError(f"未知模式: {mode}, 应为 'all' | 'sample'")
+
+
+
+if __name__ == "__main__":
+    bone_list = ["head", "neck", "jaw", "eye"]
+    bone_limits = {
+        "head": [-30, 30],
+        "neck": 0,          # 固定
+        "jaw": [-10, 10],
+        # "eye" 未定义 → 默认 0
+    }
+    step = 10
+
+    # 1️⃣ 全部组合
+    all_combos = generate_bone_rotations(bone_list, bone_limits, step, mode="all")
+    print(f"all 模式生成 {len(all_combos)} 个组合")
+    print(all_combos[:5])
+
+    # 2️⃣ 随机采样
+    samples = generate_bone_rotations(bone_list, bone_limits, step, mode="sample", sample_count=5)
+    print("\n随机采样 5 个组合：")
+    print(samples)
 
