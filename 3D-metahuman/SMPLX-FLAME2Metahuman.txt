@@ -7,8 +7,17 @@ https://github.com/yfeng95/DECA
 https://github.com/radekd91/emoca
 
 
+从视频提取表情数据集 
+1. 新闻联播
+1) https://www.bilibili.com/video/BV1vb4y1t77y/?spm_id_from=333.337.search-card.all.click&vd_source=89db475a085d6a39d2dc35e7290740ed
+2) https://www.bilibili.com/video/BV18V411C7QA/?spm_id_from=333.337.search-card.all.click&vd_source=89db475a085d6a39d2dc35e7290740ed
+3) https://www.bilibili.com/video/BV164411j7R6/?spm_id_from=333.337.search-card.all.click&vd_source=89db475a085d6a39d2dc35e7290740ed
+4) https://www.bilibili.com/video/BV1mE41137y5/?spm_id_from=333.337.search-card.all.click&vd_source=89db475a085d6a39d2dc35e7290740ed
 
 
+
+跳舞
+https://space.bilibili.com/690005481/upload/video
 
 
 
