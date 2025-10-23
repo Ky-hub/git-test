@@ -6,6 +6,8 @@ https://github.com/vchoutas/expose
 https://github.com/yfeng95/DECA
 https://github.com/radekd91/emoca
 
+动捕
+GVHMR
 
 从视频提取表情数据集 
 1. 新闻联播
