@@ -1,2 +1,6 @@
 1. 语音驱动虚拟形象口型
 https://zhuanlan.zhihu.com/p/488004499
+
+2. 3DiFace 
+http://www.360doc.com/content/24/0221/15/54183077_1114726917.shtml
+github: https://github.com/bala1144/3DiFACE
