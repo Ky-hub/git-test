@@ -4,3 +4,9 @@ https://zhuanlan.zhihu.com/p/488004499
 2. 3DiFace 
 http://www.360doc.com/content/24/0221/15/54183077_1114726917.shtml
 github: https://github.com/bala1144/3DiFACE
+
+
+
+开源方案 
+facegood audio2face 
+https://blog.csdn.net/yuanlulu/article/details/137006942
