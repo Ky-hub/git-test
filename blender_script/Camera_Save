@@ -1,0 +1,50 @@
+import bpy
+import os
+
+def render_camera_sequence(camera_name=None, output_dir="//renders", file_prefix="frame_"):
+    scene = bpy.context.scene
+    
+    # 如果没有指定相机，就用当前激活的相机
+    if camera_name is None:
+        camera = scene.camera
+        if camera is None:
+            raise ValueError("没有指定相机，也没有激活相机。")
+    else:
+        camera = bpy.data.objects.get(camera_name)
+        if camera is None:
+            raise ValueError(f"找不到名为 {camera_name} 的相机。")
+    
+    # 输出路径
+    output_path = bpy.path.abspath(output_dir)
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    
+    # 记录原始输出设置
+    original_camera = scene.camera
+    original_filepath = scene.render.filepath
+
+    # 设置当前相机
+    scene.camera = camera
+
+    # 帧范围
+    start_frame = scene.frame_start
+    end_frame = scene.frame_end
+
+    print(f"开始渲染: {start_frame} 到 {end_frame}，相机: {camera.name}")
+    print(f"输出目录: {output_path}")
+
+    for frame in range(start_frame, end_frame + 1):
+        scene.frame_set(frame)
+        filename = f"{file_prefix}{frame:04d}.png"
+        scene.render.filepath = os.path.join(output_path, filename)
+        bpy.ops.render.render(write_still=True)
+        print(f"渲染完成: {filename}")
+
+    # 恢复设置
+    scene.camera = original_camera
+    scene.render.filepath = original_filepath
+    print("渲染完毕 ✅")
+
+# 使用示例：
+render_camera_sequence("Camera", "//renders")
+# render_camera_sequence(camera_name="MyCam", output_dir="D:/blender_renders")
