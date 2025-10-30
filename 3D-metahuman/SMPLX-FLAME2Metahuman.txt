@@ -25,16 +25,6 @@ https://space.bilibili.com/690005481/upload/video
 
 
 
-
-
-
-
-
-
-
-
-
-
 flame 相关模型汇总 
 https://github.com/TimoBolkart/FLAME-Universe
 
@@ -43,7 +33,10 @@ https://github.com/TimoBolkart/FLAME-Universe
 
 
 
-
+当前数据集信息
+人数：4
+总时长：60+51+37*60+24+1*60+44+1*60+9
+抽取总帧数：
 
 
 
