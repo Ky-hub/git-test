@@ -1,2 +1,6 @@
 1. UE 插件
 https://github.com/ViktroNZ/Puppeteer
+
+
+2. Visemator UE 插件演示 —— 快速驱动 MetaHuman 的音频口型动画
+https://www.bilibili.com/video/BV14CE9ztE8b/?vd_source=89db475a085d6a39d2dc35e7290740ed
