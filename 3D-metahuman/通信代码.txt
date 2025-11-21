@@ -1,0 +1,58 @@
+import requests
+
+def send_audio_to_url(url: str, file_path: str, sender_id: str = "client_01", user_index: int = 0):
+    try:
+        with open(file_path, 'rb') as f:
+            audio_data = f.read()
+
+            headers = {
+                'Content-Type': "audio/wav",
+                'Content-Length': str(len(audio_data)),
+                'X-Sender-ID': sender_id,     # 字符串字段
+                'X-User-Index': str(user_index)  # 整数字段（需转成字符串）
+            }
+
+            print("发送中...")
+            response = requests.post(url, headers=headers, data=audio_data)
+            print(f"请求成功，响应状态码：{response.status_code}")
+            return response
+
+    except FileNotFoundError:
+        print(f"错误：音频文件 '{file_path}' 不存在")
+    except requests.exceptions.RequestException as e:
+        print(f"发送请求到 {url} 失败：{str(e)}")
+    except Exception as e:
+        print(f"发送音频时发生未知错误：{str(e)}")
+
+
+flask 端
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route("/upload_audio", methods=["POST"])
+def upload_audio():
+
+    # 读取身份字段
+    sender_id = request.headers.get("X-Sender-ID", "unknown")
+
+    # 读取整数字段
+    user_index_value = request.headers.get("X-User-Index", "-1")
+    try:
+        user_index = int(user_index_value)
+    except ValueError:
+        user_index = -1   # 转换失败使用默认值
+
+    print("发送者 ID:", sender_id)
+    print("User Index:", user_index)
+
+    # 读取音频二进制数据
+    audio_data = request.data
+    print("收到音频字节数:", len(audio_data))
+
+    # 保存音频（可选）
+    file_name = f"received_{sender_id}_{user_index}.wav"
+    with open(file_name, "wb") as f:
+        f.write(audio_data)
+
+    return {"status": "ok", "sender": sender_id, "user_index": user_index}
