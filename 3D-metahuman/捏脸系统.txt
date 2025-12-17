@@ -18,3 +18,4 @@ https://www.bilibili.com/video/BV1TK4y1B7ta/
 
 【MetaVance】一款基于UE5开发的实时捏脸程序，创建角色，选择服饰，选择场景，图片生成3D模型，连接CyanSdk AI动作捕捉
 https://www.bilibili.com/video/BV11TnezMEg3/
+metavance:  baidu云盘链接: https://pan.baidu.com/s/1jXjPki7af5Z92qO9u-r7_w?pwd=ujjp 提取码: ujjp
