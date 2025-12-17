@@ -1,8 +1,14 @@
 捏脸系统：这一百多个参数把我做吐了
 https://www.bilibili.com/video/BV1X44y1P7Ur
 
-Metahuman捏脸化妆展示
-https://www.bilibili.com/video/BV1rQNme3E2t
+{
+  Metahuman捏脸化妆展示
+  https://www.bilibili.com/video/BV1rQNme3E2t
+
+  ue5基于metahuman写的捏脸框架
+  https://www.bilibili.com/video/BV1aV4y1D7mu/
+}
+
 
 [hs2/Ai 少女][AI捏脸] 使用AI提取面部数据进行捏脸
 https://www.bilibili.com/video/BV1fN411U73g/
@@ -10,5 +16,5 @@ https://www.bilibili.com/video/BV1fN411U73g/
 我既然不知道AI也能玩捏脸,AI实时捏脸！
 https://www.bilibili.com/video/BV1TK4y1B7ta/
 
-我既然不知道AI也能玩捏脸,AI实时捏脸！
-https://www.bilibili.com/video/BV1TK4y1B7ta/
+【MetaVance】一款基于UE5开发的实时捏脸程序，创建角色，选择服饰，选择场景，图片生成3D模型，连接CyanSdk AI动作捕捉
+https://www.bilibili.com/video/BV11TnezMEg3/
