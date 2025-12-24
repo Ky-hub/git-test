@@ -1,2 +1,6 @@
 daz studio主要用来做什么
 https://www.zhihu.com/question/349290837
+
+
+https://www.bilibili.com/video/BV1nP411v7SG/
+MetaHuman模型Wrap重拓扑给Daz3d网格 自定义服装绑定 将daz3d衣服添加给metahuman模型
