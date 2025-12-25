@@ -1,3 +1,8 @@
 
 [国语] 如何给UE5.6 的Metahuman 创建服装，只用 UE5.6 完成全流程。
 https://www.bilibili.com/video/BV1vwMCzJErY/
+
+
+[国语] 虚幻引擎5 如何获得完美的服装模拟解算
+https://www.bilibili.com/video/BV1qhMtz5EeF/
+
