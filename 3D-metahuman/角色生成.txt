@@ -1,3 +1,0 @@
-https://charactergen.github.io/
-CharacterGen: Efficient 3D Character Generation from Single Images with Multi-View Pose Calibration
-SIG2024
