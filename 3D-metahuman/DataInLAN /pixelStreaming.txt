@@ -1,4 +1,0 @@
-
-sceneCapture2d 
-ffmpeg 
-tcp-ip 
