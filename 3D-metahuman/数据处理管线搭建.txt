@@ -1,0 +1,5 @@
+
+
+人脸相关模型
+https://modelscope.cn/models/iic/cv_manual_face-detection_ulfd/summary
+
