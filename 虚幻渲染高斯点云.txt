@@ -5,5 +5,5 @@
 
 
 
-
+UE5 3D高斯处理插件
 https://github.com/Italink/GaussianSplattingForUnrealEngine
