@@ -1,0 +1,63 @@
+import re
+
+def generate_body_obj_for_metahuman(
+    full_obj_path,
+    head_obj_path,
+    out_body_obj_path
+):
+    """
+    MetaHuman-safe:
+    从 full.obj + head.obj 生成 body.obj
+    - 完全保留 full.obj 的 v / vt / vn（顺序 & 数量）
+    - 删除 head 的 faces
+    """
+
+    # ---------- 1. 读取 OBJ ----------
+    with open(full_obj_path, "r", encoding="utf-8") as f:
+        full_lines = f.readlines()
+
+    with open(head_obj_path, "r", encoding="utf-8") as f:
+        head_lines = f.readlines()
+
+    # ---------- 2. 提取 head 的 face key ----------
+    # 使用顶点索引集合（而不是整行字符串），防止顺序/空格差异
+    head_face_keys = set()
+
+    for line in head_lines:
+        if not line.startswith("f "):
+            continue
+        # f v/vt/vn v/vt/vn v/vt/vn
+        ids = re.findall(r"\d+", line)
+        v_ids = tuple(int(ids[i]) for i in range(0, len(ids), 3))
+        head_face_keys.add(v_ids)
+
+    # ---------- 3. 过滤 full 的 faces ----------
+    body_faces = []
+
+    for line in full_lines:
+        if not line.startswith("f "):
+            continue
+
+        ids = re.findall(r"\d+", line)
+        v_ids = tuple(int(ids[i]) for i in range(0, len(ids), 3))
+
+        # 如果这个 face 在 head 里 → 删除
+        if v_ids in head_face_keys:
+            continue
+
+        body_faces.append(line)
+
+    # ---------- 4. 写 body.obj ----------
+    with open(out_body_obj_path, "w", encoding="utf-8") as f:
+        # 写 v / vt / vn / 其它非 face 行
+        for line in full_lines:
+            if line.startswith("f "):
+                continue
+            f.write(line)
+
+        f.write("\n")
+        f.write("g body\n")
+        f.writelines(body_faces)
+
+    print("✔ MetaHuman Body OBJ generated")
+    print("  →", out_body_obj_path)
