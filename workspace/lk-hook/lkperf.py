@@ -3,7 +3,7 @@
 LiveKit Agent 专用性能探针（生产完整版）
 - 精确时间戳：start_us / end_us 微秒级
 - 嵌套识别：ContextVar 调用栈，自动 parent_id
-- 线程安全：asyncio / 多线程混合
+- 线程安全：asyncio / 多线程混合（含线程池 fallback）
 - 内存防溢出：deque 滑动窗口
 - 后台持久化：按日期分目录，按小时合并 JSONL
 - 配置驱动 + 热重载：lkperf.json
@@ -169,17 +169,35 @@ class __LKPerfConfigWatcher:
             return self._config
 
 
-# ========== 2. 协程级上下文 ==========
-# FIX: 默认值改为 None，避免多线程/多协程共享同一个空列表
+# ========== 2. 协程级上下文 + 线程 fallback ==========
+# FIX 1: 默认值改为 None，避免多线程/多协程共享同一个空列表
 _lkp_uid_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("_lkp_uid", default="")
 _lkp_room_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("_lkp_room", default="")
 _lkp_stack_ctx: contextvars.ContextVar[Optional[List[str]]] = contextvars.ContextVar("_lkp_stack", default=None)
+
+# FIX 2: 线程本地存储，用于线程池场景 fallback
+_lkp_thread_stack: threading.local = threading.local()
+
+def _lkp_get_stack() -> List[str]:
+    """获取当前调用栈，优先 ContextVar，回退 thread local。"""
+    stack = _lkp_stack_ctx.get()
+    if stack is not None:
+        return stack
+    stack = getattr(_lkp_thread_stack, "stack", None)
+    if stack is not None:
+        return stack
+    return []
+
+def _lkp_set_stack(stack: List[str]) -> None:
+    """设置当前调用栈，同时更新 ContextVar 和 thread local。"""
+    _lkp_stack_ctx.set(stack)
+    _lkp_thread_stack.stack = stack
 
 
 def lkp_bind(room: str, uid: str) -> None:
     _lkp_room_ctx.set(room)
     _lkp_uid_ctx.set(uid)
-    _lkp_stack_ctx.set([])
+    _lkp_set_stack([])
 
 
 # ========== 3. 数据模型（含 tags） ==========
@@ -286,21 +304,19 @@ class __LKPerfRegistry:
             yield
             return
 
-        # FIX: 安全获取栈，避免共享默认列表
-        stack = _lkp_stack_ctx.get()
-        if stack is None:
-            stack = []
+        # FIX 3: 使用统一的栈获取接口
+        stack = _lkp_get_stack()
 
         parent_id = stack[-1] if stack else None
         trace_id = str(uuid.uuid4())[:8]
-        _lkp_stack_ctx.set(stack + [trace_id])
+        _lkp_set_stack(stack + [trace_id])
 
         t0 = time.perf_counter()
         start_us = int(time.time() * 1_000_000)
         try:
             yield
         finally:
-            _lkp_stack_ctx.set(stack)
+            _lkp_set_stack(stack)
             self._record(name, time.perf_counter() - t0,
                          start_us=start_us,
                          trace_id=trace_id,
@@ -377,7 +393,15 @@ class __LKPerfRegistry:
             return "[LKPerf] No data for tree"
 
         pool.reverse()
+        # FIX 4: 放宽根节点选择，先尝试 "frame" 名称，否则回退到所有 parent_id is None
         roots = [s for s in pool if s.parent_id is None and "frame" in s.name]
+        if not roots:
+            roots = [s for s in pool if s.parent_id is None]
+        if not roots:
+            # 如果连 parent_id is None 的都没有，说明所有 span 都是孤儿节点
+            # 使用最早的几个 span 作为根节点
+            roots = pool[:last_n_frames] if pool else []
+
         children_map: Dict[str, List[LKPerfSpan]] = defaultdict(list)
         for s in pool:
             if s.parent_id:
@@ -470,21 +494,19 @@ class __LKPerfWrapper:
         if asyncio.iscoroutinefunction(func):
             @functools.wraps(func)
             async def _async_wrapper(*args: Any, **kwargs: Any):
-                # FIX: 接入调用栈，正确设置 parent_id / trace_id
-                stack = _lkp_stack_ctx.get()
-                if stack is None:
-                    stack = []
+                # FIX 5: 接入调用栈，正确设置 parent_id / trace_id
+                stack = _lkp_get_stack()
                 parent_id = stack[-1] if stack else None
                 trace_id = str(uuid.uuid4())[:8]
-                _lkp_stack_ctx.set(stack + [trace_id])
+                _lkp_set_stack(stack + [trace_id])
 
                 t0 = time.perf_counter()
                 start_us = int(time.time() * 1_000_000)
                 try:
                     return await func(*args, **kwargs)
                 finally:
-                    _lkp_stack_ctx.set(stack)
-                    __lkp_reg._record(
+                    _lkp_set_stack(stack)
+                    _lkp_reg._record(
                         label, time.perf_counter() - t0,
                         start_us=start_us,
                         trace_id=trace_id,
@@ -495,21 +517,19 @@ class __LKPerfWrapper:
 
         @functools.wraps(func)
         def _sync_wrapper(*args: Any, **kwargs: Any):
-            # FIX: 接入调用栈，正确设置 parent_id / trace_id
-            stack = _lkp_stack_ctx.get()
-            if stack is None:
-                stack = []
+            # FIX 6: 接入调用栈，正确设置 parent_id / trace_id
+            stack = _lkp_get_stack()
             parent_id = stack[-1] if stack else None
             trace_id = str(uuid.uuid4())[:8]
-            _lkp_stack_ctx.set(stack + [trace_id])
+            _lkp_set_stack(stack + [trace_id])
 
             t0 = time.perf_counter()
             start_us = int(time.time() * 1_000_000)
             try:
                 return func(*args, **kwargs)
             finally:
-                _lkp_stack_ctx.set(stack)
-                __lkp_reg._record(
+                _lkp_set_stack(stack)
+                _lkp_reg._record(
                     label, time.perf_counter() - t0,
                     start_us=start_us,
                     trace_id=trace_id,
@@ -522,8 +542,8 @@ class __LKPerfWrapper:
 # ========== 6. 全局初始化 ==========
 _lkp_watcher = __LKPerfConfigWatcher()
 _lkp_cfg = _lkp_watcher.load()
-__lkp_reg = __LKPerfRegistry(_lkp_cfg)
-_lkp_watcher.start_monitor(__lkp_reg)
+_lkp_reg = __LKPerfRegistry(_lkp_cfg)
+_lkp_watcher.start_monitor(_lkp_reg)
 
 
 # ========== 7. Patch 逻辑 ==========
@@ -679,7 +699,7 @@ _lkp_apply_class_patches_from_config(_lkp_cfg)
 
 @contextmanager
 def lkp_block(name: str, *, tags: Optional[List[str]] = None, **meta):
-    with __lkp_reg._block(name, tags=tags, **meta):
+    with _lkp_reg._block(name, tags=tags, **meta):
         yield
 
 
@@ -691,29 +711,29 @@ def lkp_wrap(func: Optional[Callable] = None, *, tags: Optional[List[str]] = Non
 
 def lkp_report(uid: Optional[str] = None, room: Optional[str] = None,
                tag: Optional[str] = None, top_n: int = 20) -> str:
-    return __lkp_reg._report(uid, room, tag, top_n)
+    return _lkp_reg._report(uid, room, tag, top_n)
 
 
 def lkp_tree(uid: Optional[str] = None, room: Optional[str] = None,
              last_n_frames: int = 1) -> str:
-    return __lkp_reg._tree(uid, room, last_n_frames)
+    return _lkp_reg._tree(uid, room, last_n_frames)
 
 
 def lkp_summary() -> List[Dict[str, Any]]:
-    return __lkp_reg._summary_by_user()
+    return _lkp_reg._summary_by_user()
 
 
 def lkp_reset() -> None:
-    __lkp_reg._reset()
+    _lkp_reg._reset()
 
 
 def lkp_enable(yes: bool = True) -> None:
-    __lkp_reg._enabled = yes
+    _lkp_reg._enabled = yes
     _lkp_logger.info(f"Probe enabled={yes}")
 
 
 def lkp_dump(path: str) -> None:
-    __lkp_reg._dump(path)
+    _lkp_reg._dump(path)
 
 
 def lkp_reload(config_path: Optional[str] = None) -> None:
@@ -722,10 +742,33 @@ def lkp_reload(config_path: Optional[str] = None) -> None:
         _lkp_watcher._config = cfg
     else:
         cfg = _lkp_watcher.load()
-    __lkp_reg._apply_config(cfg)
+    _lkp_reg._apply_config(cfg)
     _lkp_apply_patches_from_config(cfg)
     _lkp_apply_class_patches_from_config(cfg)
     _lkp_logger.info("Manual reload completed")
+
+
+# ========== 9. 线程池辅助函数 ==========
+def lkp_run_in_executor(executor, fn: Callable, *args):
+    """
+    在线程池中执行任务，自动传递 LKPerf 调用栈上下文。
+    用法: result = await lkp_run_in_executor(executor, cpu_bound_func, arg1, arg2)
+    """
+    import asyncio
+    loop = asyncio.get_running_loop()
+    # 捕获当前上下文
+    stack = _lkp_get_stack()
+    room = _lkp_room_ctx.get()
+    uid = _lkp_uid_ctx.get()
+
+    def _wrapper(*a):
+        # 在新线程中恢复上下文
+        _lkp_room_ctx.set(room)
+        _lkp_uid_ctx.set(uid)
+        _lkp_set_stack(list(stack))  # 复制一份，避免共享引用
+        return fn(*a)
+
+    return loop.run_in_executor(executor, functools.partial(_wrapper, *args))
 
 
 __all__ = [
@@ -741,6 +784,7 @@ __all__ = [
     "lkp_enable",
     "lkp_dump",
     "lkp_reload",
+    "lkp_run_in_executor",
     "LKPerfConfig",
     "LKPerfSpan",
 ]
