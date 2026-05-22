@@ -330,8 +330,7 @@ class __LKPerfRegistry:
             groups[s.name].append(s.duration_ms)
 
         lines = [
-            f"
-=== LKPerf Report [uid={uid or 'ALL'} room={room or 'ALL'} tag={tag or 'ALL'}] ===",
+            f"\n=== LKPerf Report [uid={uid or 'ALL'} room={room or 'ALL'} tag={tag or 'ALL'}] ===",
             f"Total spans: {len(pool)}",
         ]
         stats = []
@@ -346,8 +345,7 @@ class __LKPerfRegistry:
                 f"{name:35s} cnt={cnt:>3} avg={avg:>7.2f}ms "
                 f"p99={p99:>7.2f}ms max={mx:>7.2f}ms"
             )
-        return "
-".join(lines)
+        return "\n".join(lines)
 
     def _summary_by_user(self) -> List[Dict[str, Any]]:
         users = defaultdict(lambda: {"frames": 0, "total_ms": 0.0, "max_ms": 0.0})
@@ -401,8 +399,7 @@ class __LKPerfRegistry:
             dfs(root)
             lines.append("")
 
-        return "
-".join(lines)
+        return "\n".join(lines)
 
     def _reset(self) -> None:
         with self._lock:
@@ -452,8 +449,7 @@ class __LKPerfRegistry:
                 try:
                     with open(fname, "a", encoding="utf-8") as f:
                         for item in batch:
-                            f.write(json.dumps(item, ensure_ascii=False) + "
-")
+                            f.write(json.dumps(item, ensure_ascii=False) + "\n")
                     _lkp_logger.info(f"Flushed {len(batch)} spans -> {fname}")
                 except Exception as e:
                     _lkp_logger.error(f"Flush failed: {e}")
