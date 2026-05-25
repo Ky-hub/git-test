@@ -1,1 +1,195 @@
-xxxx
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <title>LKPerf Viewer</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="globalLoading" class="loading-overlay" style="display:none;">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">正在加载...</div>
+    </div>
+
+    <div class="header">
+        <h2>📊 LKPerf 日志查看器</h2>
+        <div class="controls">
+            <button onclick="backToDates()" id="backBtn" style="display:none;">← 返回日期</button>
+            <button class="theme-toggle" onclick="toggleTheme()" id="themeBtn">🌙</button>
+        </div>
+    </div>
+
+    <div id="datePickerPanel" class="panel wide">
+        <h3>选择日期</h3>
+        <div id="dateGrid" class="date-grid"><div class="loading-inline">正在扫描...</div></div>
+    </div>
+
+    <div id="dayPanel" style="display:none;">
+        <!-- 24小时分布表格 -->
+        <div class="panel wide">
+            <h3>
+                <span id="currentDate">2026-05-14</span> 24小时分布
+                <span class="hint">点击行可快速选中该小时段 · 内部 UTC</span>
+            </h3>
+            <table id="hourlyTable">
+                <thead>
+                    <tr><th>小时 (UTC)</th><th>条数</th><th>总耗时</th><th>高频函数 Top3</th><th>操作</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- 时间段选择 -->
+        <div class="panel wide">
+            <h3>选择分析时间段</h3>
+            <div class="time-selector">
+                <div class="time-inputs">
+                    <label>从 <input type="time" id="inputStart" value="00:00"></label>
+                    <label>到 <input type="time" id="inputEnd" value="23:59"></label>
+                    <button onclick="applyInputTime()">应用</button>
+                </div>
+
+                <div class="range-slider-container" style="margin-top:15px;">
+                    <div class="slider-labels">
+                        <span id="sliderStart">00:00</span>
+                        <span id="sliderRangeText">全天</span>
+                        <span id="sliderEnd">23:59</span>
+                    </div>
+                    <div class="dual-slider" id="dualSlider">
+                        <div class="slider-track"></div>
+                        <div class="slider-range" id="sliderRange"></div>
+                        <div class="slider-thumb left" id="thumbLeft"></div>
+                        <div class="slider-thumb right" id="thumbRight"></div>
+                    </div>
+                    <div class="slider-hint">
+                        <span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>23:59</span>
+                    </div>
+                </div>
+
+                <div class="slider-actions" style="margin-top:10px;">
+                    <button onclick="selectPreset('last1h')" id="preset-last1h" disabled>最近1小时</button>
+                    <button onclick="selectPreset('morning')" id="preset-morning">上午 06-12</button>
+                    <button onclick="selectPreset('afternoon')" id="preset-afternoon">下午 12-18</button>
+                    <button onclick="selectPreset('evening')" id="preset-evening">晚上 18-24</button>
+                    <button onclick="selectPreset('night')" id="preset-night">凌晨 00-06</button>
+                    <button onclick="selectPreset('all')" id="preset-all" class="active">全天</button>
+                </div>
+
+                <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <label style="color:var(--text-dim);font-size:13px;">显示时区：</label>
+                    <select id="tzSelect" onchange="onTzChange()" style="background:var(--input-bg);color:var(--input-text);border:1px solid var(--input-border);padding:4px 8px;border-radius:4px;font-size:13px;">
+                        <option value="UTC" selected>UTC（与探针对齐）</option>
+                        <option value="local">本地时间</option>
+                        <option value="Asia/Shanghai">北京时间</option>
+                        <option value="America/New_York">纽约</option>
+                        <option value="Europe/London">伦敦</option>
+                    </select>
+                    <span class="hint" id="tzHint">当前按 UTC 显示</span>
+                </div>
+            </div>
+
+            <div style="margin-top:15px;display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;">
+                <div class="filter-wrap">
+                    <input type="text" id="nameFilter" placeholder="函数名过滤" autocomplete="off">
+                    <div class="dropdown-list" id="nameDropdown"></div>
+                </div>
+                <div class="filter-wrap">
+                    <input type="text" id="tagFilter" placeholder="标签过滤" autocomplete="off">
+                    <div class="dropdown-list" id="tagDropdown"></div>
+                </div>
+                <div class="filter-wrap">
+                    <input type="text" id="roomFilter" placeholder="房间过滤" autocomplete="off">
+                    <div class="dropdown-list" id="roomDropdown"></div>
+                </div>
+                <button onclick="refreshAll()" style="margin-top:1px;">刷新统计</button>
+            </div>
+        </div>
+
+        <!-- 统计表格 -->
+        <div class="panel wide">
+            <h3>函数统计（当前时间段内）</h3>
+            <table id="statsTable">
+                <thead>
+                    <tr><th>函数名</th><th>次数</th><th>平均</th><th>最小</th><th>最大</th>
+                        <th>P50</th><th>P95</th><th>P99</th><th>总耗时</th><th>占比</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <!-- Trace 树形视图 -->
+        <div class="panel wide">
+            <h3>
+                Trace 树形视图（当前时间段）
+                <span class="hint">点击 Trace 查看完整调用链 · 过滤条件会高亮匹配节点</span>
+            </h3>
+            <div id="traceList" style="margin-bottom:15px;max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;">
+                <div class="loading-inline">选择日期后加载...</div>
+            </div>
+            <div id="traceTreeContainer" style="display:none;">
+                <div style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+                    <strong id="treeRootName" style="color:var(--accent);"></strong>
+                    <button onclick="closeTree()" style="font-size:12px;">关闭</button>
+                </div>
+                <div class="tree-hint">
+                    💡 提示：当前为纯串行调用树。父节点时间精确覆盖所有子孙节点。
+                    过滤后，匹配项以<strong>高亮边框</strong>标注，不相关分支自动淡化。
+                </div>
+                <div id="traceTree" class="tree-view"></div>
+            </div>
+        </div>
+
+        <!-- Timeline 时序视图 -->
+        <div class="panel wide">
+            <h3>
+                Timeline 时序视图
+                <span class="hint">横轴时间 · 纵轴 Swimlane（时间不重合） · 点击条块查看 Trace 树</span>
+            </h3>
+            <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <button onclick="setTlZoom(0.8)" style="padding:2px 10px;font-size:12px;background:var(--input-bg);color:var(--text-dim);border:1px solid var(--border);">-</button>
+                <input type="range" id="tlZoomSlider" min="10" max="1000" value="100" step="10" 
+                       oninput="onTlZoomSlide(this.value)" 
+                       style="width:220px;accent-color:var(--accent);">
+                <button onclick="setTlZoom(1.25)" style="padding:2px 10px;font-size:12px;background:var(--input-bg);color:var(--text-dim);border:1px solid var(--border);">+</button>
+                <span id="tlZoomText" style="font-size:12px;color:var(--text-dim);min-width:50px;font-family:monospace;">100%</span>
+                <button onclick="resetTlZoom()" style="padding:2px 10px;font-size:12px;background:var(--input-bg);color:var(--text-dim);border:1px solid var(--border);">重置</button>
+            </div>
+            <div class="timeline-wrap" id="timelineWrap">
+                <canvas id="timelineCanvas"></canvas>
+                <div class="timeline-tooltip" id="timelineTooltip"></div>
+            </div>
+        </div>
+
+        <!-- 原始记录 -->
+        <div class="panel wide">
+            <h3>
+                原始记录（当前时间段内）
+                <span class="hint">受上方时间段与过滤条件影响</span>
+                <span id="rawPageInfo" style="float:right;font-weight:normal;color:var(--text-muted);"></span>
+            </h3>
+            <table id="rawTable">
+                <thead>
+                    <tr><th>开始时间</th><th>函数名</th><th>耗时</th><th>用户</th><th>房间</th><th>标签</th><th>Trace</th></tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+            <div class="pagination">
+                <button onclick="changePage('first')" id="firstBtn">首页</button>
+                <button onclick="changePage(-1)" id="prevBtn">上一页</button>
+                <span class="page-info" id="pageIndicator">第 1 / 1 页</span>
+                <button onclick="changePage(1)" id="nextBtn">下一页</button>
+                <button onclick="changePage('last')" id="lastBtn">末页</button>
+                <span style="margin-left:10px;">跳到</span>
+                <input type="number" id="jumpPage" min="1" value="1" style="width:50px;text-align:center;">
+                <span>页</span>
+                <button onclick="jumpToPage()">跳转</button>
+                <span style="margin-left:10px;">每页</span>
+                <input type="number" id="pageSize" value="50" min="10" max="500" style="width:60px;">
+                <span>条</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
