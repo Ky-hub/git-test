@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>MsgPack Chat Viewer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="app">
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h1>📦 MsgPack Chat</h1>
+                <button onclick="loadFiles()">🔄</button>
+            </div>
+            <div class="search-wrap">
+                <input type="text" class="search-box" id="search" placeholder="搜索文件或文件夹..." oninput="onSearch()">
+            </div>
+            <div class="file-tree" id="file-tree">
+                <div class="empty-state">加载中...</div>
+            </div>
+        </div>
+        <div class="chat-area">
+            <div class="chat-header" id="chat-header" style="display:none">
+                <span class="chat-title" id="chat-title">未选择</span>
+                <div class="chat-actions">
+                    <a class="btn" id="download-btn" href="#" target="_blank">⬇️ 下载</a>
+                    <button class="btn" onclick="toggleRaw()">📄 原始JSON</button>
+                </div>
+            </div>
+            <div class="chat-messages" id="chat-messages">
+                <div class="empty-state">
+                    <div>← 从左侧选择文件查看对话</div>
+                    <div style="font-size:12px;color:#8b949e;margin-top:8px">支持 msgpack 编码的对话数据</div>
+                </div>
+            </div>
+            <div class="chat-raw" id="chat-raw" style="display:none">
+                <pre id="raw-content"></pre>
+            </div>
+        </div>
+    </div>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
