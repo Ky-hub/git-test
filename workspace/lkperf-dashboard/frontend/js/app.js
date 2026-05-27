@@ -16,6 +16,96 @@ let timelineLayout = [];
 let tlScale = 1;
 let currentTz = localStorage.getItem('lkperf-tz') || 'UTC';
 
+let latencyData = [];
+let latencyLayout = [];
+
+let _wheelBound = false;
+const _syncPairs = new Set();
+
+/* ========== 双 Timeline 滚动同步（去重绑定） ========== */
+function syncScroll(sourceId, targetId) {
+    const pairKey = `${sourceId}->${targetId}`;
+    if (_syncPairs.has(pairKey)) return;
+    _syncPairs.add(pairKey);
+
+    const src = document.getElementById(sourceId);
+    const tgt = document.getElementById(targetId);
+    if (!src || !tgt) return;
+
+    let isSyncing = false;
+    src.addEventListener('scroll', () => {
+        if (isSyncing) return;
+        if (Math.abs(tgt.scrollLeft - src.scrollLeft) > 2) {
+            isSyncing = true;
+            tgt.scrollLeft = src.scrollLeft;
+            requestAnimationFrame(() => { isSyncing = false; });
+        }
+    });
+}
+
+/* ========== 统一渲染 + 滚动对齐 ========== */
+function syncRender() {
+    renderTimeline();
+    renderLatencyTimeline();
+    const tWrap = document.getElementById('timelineWrap');
+    const lWrap = document.getElementById('latencyWrap');
+    if (tWrap && lWrap) lWrap.scrollLeft = tWrap.scrollLeft;
+}
+
+/* ========== 统一滚轮缩放（全局绑定，只执行一次） ========== */
+function bindWheelZoom() {
+    if (_wheelBound) return;
+    _wheelBound = true;
+
+    const tWrap = document.getElementById('timelineWrap');
+    const lWrap = document.getElementById('latencyWrap');
+
+    if (tWrap) tWrap.addEventListener('wheel', (e) => handleWheel(e, 'timelineWrap'), { passive: false });
+    if (lWrap) lWrap.addEventListener('wheel', (e) => handleWheel(e, 'latencyWrap'), { passive: false });
+}
+
+function handleWheel(e, sourceId) {
+    e.preventDefault();
+    const bounds = computeUnifiedBounds();
+    if (!bounds) return;
+    const { minT, maxT, range } = bounds;
+
+    const sourceWrap = document.getElementById(sourceId);
+    if (!sourceWrap) return;
+
+    const padLeft = 80;
+    const padRight = 10;
+    const MAX_CANVAS_WIDTH = 30000;
+
+    const tWrap = document.getElementById('timelineWrap');
+    const lWrap = document.getElementById('latencyWrap');
+    const containerW = Math.max(tWrap?.clientWidth || 0, lWrap?.clientWidth || 0, 1200);
+
+    const currentDrawWidth = Math.max(containerW * tlScale, containerW);
+
+    const rect = sourceWrap.getBoundingClientRect();
+    const offsetX = e.clientX - rect.left;
+
+    const anchorTime = minT + ((offsetX - padLeft) / currentDrawWidth) * range;
+
+    if (e.deltaY < 0) tlScale *= 1.2;
+    else tlScale /= 1.2;
+    tlScale = Math.max(0.01, tlScale);
+
+    let newDrawWidth = Math.max(containerW * tlScale, containerW);
+    if (padLeft + newDrawWidth + padRight > MAX_CANVAS_WIDTH) {
+        newDrawWidth = MAX_CANVAS_WIDTH - padLeft - padRight;
+        tlScale = newDrawWidth / containerW;
+    }
+
+    const newAnchorOffsetX = padLeft + ((anchorTime - minT) / range) * newDrawWidth;
+    sourceWrap.scrollLeft += (newAnchorOffsetX - offsetX);
+
+    updateTlZoomUI();
+    updateLatZoomUI();
+    syncRender();
+}
+
 /* ========== 时区工具 ========== */
 function getTzOffsetMinutes(tz) {
     if (tz === 'UTC') return 0;
@@ -64,7 +154,7 @@ function onTzChange() {
     loadTraces();
     loadRawSpans();
     refreshStats();
-    renderTimeline();
+    syncRender();
     const treeContainer = document.getElementById('traceTreeContainer');
     if (treeContainer && treeContainer.style.display !== 'none') {
         const rootText = document.getElementById('treeRootName')?.textContent || '';
@@ -73,7 +163,34 @@ function onTzChange() {
     }
 }
 
-/* ========== Timeline 缩放控制 ========== */
+/* ========== 统一时间边界（跨视图对齐） ========== */
+function computeUnifiedBounds() {
+    let minT = Infinity, maxT = -Infinity;
+    let hasData = false;
+
+    if (timelineData && timelineData.length > 0) {
+        for (const s of timelineData) {
+            minT = Math.min(minT, s.start_us);
+            maxT = Math.max(maxT, s.start_us + Math.round((s.ms || 0) * 1000));
+        }
+        hasData = true;
+    }
+
+    if (latencyData && latencyData.length > 0) {
+        for (const r of latencyData) {
+            minT = Math.min(minT, r.mark_us);
+            if (r.measure_us) maxT = Math.max(maxT, r.measure_us);
+            else if (r.bind_us) maxT = Math.max(maxT, r.bind_us);
+            else maxT = Math.max(maxT, r.mark_us);
+        }
+        hasData = true;
+    }
+
+    if (!hasData) return null;
+    return { minT, maxT, range: Math.max(maxT - minT, 1) };
+}
+
+/* ========== 缩放控制（两个视图共用 tlScale） ========== */
 function updateTlZoomUI() {
     const slider = document.getElementById('tlZoomSlider');
     const text = document.getElementById('tlZoomText');
@@ -87,20 +204,43 @@ function onTlZoomSlide(val) {
     tlScale = Math.max(0.01, val / 100);
     const text = document.getElementById('tlZoomText');
     if (text) text.textContent = Math.round(tlScale * 100) + '%';
-    renderTimeline();
+    syncRender();
 }
 
 function setTlZoom(mult) {
     tlScale *= mult;
     tlScale = Math.max(0.01, tlScale);
     updateTlZoomUI();
-    renderTimeline();
+    updateLatZoomUI();
+    syncRender();
 }
 
 function resetTlZoom() {
     tlScale = 1;
     updateTlZoomUI();
-    renderTimeline();
+    updateLatZoomUI();
+    syncRender();
+}
+
+function updateLatZoomUI() {
+    const slider = document.getElementById('latZoomSlider');
+    const text = document.getElementById('latZoomText');
+    if (!slider || !text) return;
+    const pct = Math.max(10, Math.min(1000, Math.round(tlScale * 100)));
+    slider.value = pct;
+    text.textContent = pct + '%';
+}
+
+function onLatZoomSlide(val) {
+    onTlZoomSlide(val);
+}
+
+function setLatZoom(mult) {
+    setTlZoom(mult);
+}
+
+function resetLatZoom() {
+    resetTlZoom();
 }
 
 /* ========== 基础 UI ========== */
@@ -159,8 +299,19 @@ async function selectDate(date) {
         initSlider();
         selectPreset('all');
         rawOffset = 0;
-        await Promise.all([loadFilters(), loadRawSpans(), loadTraces()]);
-        loadTimeline();
+        await Promise.all([loadFilters(), loadRawSpans(), loadTraces(), loadLatency(), refreshLatencyStats()]);
+        tlScale = 1;
+        updateTlZoomUI();
+        updateLatZoomUI();
+        syncRender();
+        syncScroll('timelineWrap', 'latencyWrap');
+        syncScroll('latencyWrap', 'timelineWrap');
+        bindWheelZoom();
+        setTimeout(() => {
+            const tWrap = document.getElementById('timelineWrap');
+            const lWrap = document.getElementById('latencyWrap');
+            if (tWrap && lWrap) lWrap.scrollLeft = tWrap.scrollLeft;
+        }, 100);
     } catch (e) { alert('加载失败: ' + e.message); }
     finally { hideLoading(); }
 }
@@ -274,7 +425,7 @@ function selectPreset(preset) {
     if (btn) btn.classList.add('active');
 
     switch(preset) {
-        case 'last1h': return; // 已禁用
+        case 'last1h': return;
         case 'morning': sliderStartMin = 6*60; sliderEndMin = 12*60; break;
         case 'afternoon': sliderStartMin = 12*60; sliderEndMin = 18*60; break;
         case 'evening': sliderStartMin = 18*60; sliderEndMin = 24*60-1; break;
@@ -592,7 +743,7 @@ function jumpToPage() {
     loadRawSpans();
 }
 
-/* ========== Timeline 时序视图 ========== */
+/* ========== 主 Timeline 时序视图 ========== */
 async function loadTimeline() {
     if (!currentDate) return;
     const n = document.getElementById('nameFilter').value.trim();
@@ -618,7 +769,7 @@ function renderTimeline() {
     const ctx = canvas.getContext('2d');
     const tooltip = document.getElementById('timelineTooltip');
 
-    if (!timelineData.length) {
+    if (!timelineData.length && !latencyData.length) {
         canvas.width = wrap.clientWidth || 800;
         canvas.height = 60;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -626,11 +777,22 @@ function renderTimeline() {
         ctx.textAlign = 'center';
         ctx.font = '13px monospace';
         ctx.fillText('当前时间段无数据', canvas.width / 2, 35);
-        wrap.onwheel = null;
         return;
     }
 
-    // 1. Swimlane 分配（缓存）
+    const bounds = computeUnifiedBounds();
+    if (!bounds) {
+        canvas.width = wrap.clientWidth || 800;
+        canvas.height = 60;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+        ctx.textAlign = 'center';
+        ctx.font = '13px monospace';
+        ctx.fillText('当前时间段无数据', canvas.width / 2, 35);
+        return;
+    }
+    const { minT, maxT, range } = bounds;
+
     const laneKey = timelineData.length + '_' + (timelineData[0]?.trace || '') + '_' + (timelineData[timelineData.length - 1]?.trace || '');
     if (!window._cachedLanes || window._cachedLaneKey !== laneKey) {
         const sorted = [...timelineData].sort((a, b) => a.start_us - b.start_us);
@@ -654,7 +816,6 @@ function renderTimeline() {
     }
     const lanes = window._cachedLanes;
 
-    // 2. 尺寸计算（限制 Canvas 最大宽度）
     const padLeft = 80;
     const padRight = 10;
     const padTop = 24;
@@ -662,17 +823,15 @@ function renderTimeline() {
     const laneHeight = 20;
     const MAX_CANVAS_WIDTH = 30000;
 
-    const starts = timelineData.map(s => s.start_us);
-    const ends = timelineData.map(s => s.start_us + Math.round(s.ms * 1000));
-    const minT = Math.min(...starts);
-    const maxT = Math.max(...ends);
-    const range = Math.max(maxT - minT, 1);
+    const timelineWrapEl = document.getElementById('timelineWrap');
+    const latencyWrapEl = document.getElementById('latencyWrap');
+    const containerW = Math.max(timelineWrapEl?.clientWidth || 0, latencyWrapEl?.clientWidth || 0, 1200);
 
-    const containerW = wrap.clientWidth || 1200;
     const maxScale = (MAX_CANVAS_WIDTH - padLeft - padRight) / containerW;
     if (tlScale > maxScale) {
         tlScale = maxScale;
         updateTlZoomUI();
+        updateLatZoomUI();
     }
 
     const drawWidth = Math.max(containerW * tlScale, containerW);
@@ -683,10 +842,8 @@ function renderTimeline() {
     canvas.height = H;
     ctx.clearRect(0, 0, W, H);
 
-    // 3. 时间 → X
     const timeToX = (us) => padLeft + ((us - minT) / range) * drawWidth;
 
-    // 4. 刻度（固定 10 个）
     ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--border-light');
     ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
     ctx.font = '10px monospace';
@@ -702,7 +859,6 @@ function renderTimeline() {
         ctx.fillText(formatLocal(t), x, padTop - 6);
     }
 
-    // 5. 绘制条块
     timelineLayout = [];
 
     for (let li = 0; li < lanes.length; li++) {
@@ -740,28 +896,6 @@ function renderTimeline() {
         }
     }
 
-    // 6. 滚轮缩放
-    wrap.onwheel = (e) => {
-        e.preventDefault();
-        const anchorOffsetX = e.offsetX;
-        const anchorTime = minT + ((anchorOffsetX - padLeft) / drawWidth) * range;
-
-        if (e.deltaY < 0) tlScale *= 1.2;
-        else tlScale /= 1.2;
-        tlScale = Math.max(0.01, tlScale);
-
-        let newDrawWidth = Math.max(containerW * tlScale, containerW);
-        if (padLeft + newDrawWidth + padRight > MAX_CANVAS_WIDTH) {
-            newDrawWidth = MAX_CANVAS_WIDTH - padLeft - padRight;
-        }
-        const newAnchorOffsetX = padLeft + ((anchorTime - minT) / range) * newDrawWidth;
-        wrap.scrollLeft += (newAnchorOffsetX - anchorOffsetX);
-
-        updateTlZoomUI();
-        renderTimeline();
-    };
-
-    // 7. 悬停 / 点击（Tooltip fixed 定位，显示完整函数名）
     canvas.onmousemove = (e) => {
         const mx = e.offsetX;
         const my = e.offsetY;
@@ -808,6 +942,266 @@ function nameToColor(name) {
     return `hsl(${hue}, ${sat}%, ${lig}%)`;
 }
 
+/* ========== Latency 统计 ========== */
+async function refreshLatencyStats() {
+    if (!currentDate) return;
+    const n = document.getElementById('nameFilter').value.trim();
+    const t = document.getElementById('tagFilter').value.trim();
+    const r = document.getElementById('roomFilter').value.trim();
+    let url = `/api/latency_stats?date=${currentDate}&start_min=${sliderStartMin}&end_min=${sliderEndMin}`;
+    if (n) url += '&name=' + encodeURIComponent(n);
+    if (t) url += '&tag=' + encodeURIComponent(t);
+    if (r) url += '&room=' + encodeURIComponent(r);
+
+    try {
+        const res = await fetch(url);
+        const data = await res.json();
+        const tbody = document.querySelector('#latencyStatsTable tbody');
+        tbody.innerHTML = '';
+        data.forEach(s => {
+            const cls = s.p95_duration > 500 ? 'slow' : s.p95_duration > 200 ? 'warn' : 'ok';
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td title="${s.name}">${s.name.length > 50 ? s.name.slice(0,47)+'...' : s.name}</td>
+                <td>${s.cnt}</td><td class="${cls}">${s.avg_duration}ms</td>
+                <td>${s.min_duration}</td><td>${s.max_duration}</td>
+                <td>${s.p50_duration}ms</td><td class="${cls}">${s.p95_duration}ms</td>
+                <td>${s.avg_claim_delay}ms</td><td>${s.p95_claim_delay}ms</td>`;
+            tbody.appendChild(tr);
+        });
+    } catch (e) { console.error(e); }
+}
+
+/* ========== Latency Timeline ========== */
+async function loadLatency() {
+    if (!currentDate) return;
+    const n = document.getElementById('nameFilter').value.trim();
+    const t = document.getElementById('tagFilter').value.trim();
+    const r = document.getElementById('roomFilter').value.trim();
+    let url = `/api/latency_timeline?date=${currentDate}&start_min=${sliderStartMin}&end_min=${sliderEndMin}`;
+    if (n) url += '&name=' + encodeURIComponent(n);
+    if (t) url += '&tag=' + encodeURIComponent(t);
+    if (r) url += '&room=' + encodeURIComponent(r);
+
+    try {
+        const res = await fetch(url);
+        latencyData = await res.json();
+        renderLatencyTimeline();
+    } catch (e) { console.error('latency load failed', e); }
+}
+
+function renderLatencyTimeline() {
+    const canvas = document.getElementById('latencyCanvas');
+    const wrap = document.getElementById('latencyWrap');
+    const ctx = canvas.getContext('2d');
+    const tooltip = document.getElementById('latencyTooltip');
+
+    if (!latencyData.length && !timelineData.length) {
+        canvas.width = wrap.clientWidth || 800;
+        canvas.height = 60;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+        ctx.textAlign = 'center';
+        ctx.font = '13px monospace';
+        ctx.fillText('当前时间段无 Latency 数据', canvas.width / 2, 35);
+        return;
+    }
+
+    const padLeft = 80;
+    const padRight = 10;
+    const padTop = 24;
+    const padBottom = 8;
+    const laneHeight = 28;
+    const MAX_CANVAS_WIDTH = 30000;
+
+    const bounds = computeUnifiedBounds();
+    if (!bounds) {
+        canvas.width = wrap.clientWidth || 800;
+        canvas.height = 60;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+        ctx.textAlign = 'center';
+        ctx.font = '13px monospace';
+        ctx.fillText('当前时间段无 Latency 数据', canvas.width / 2, 35);
+        return;
+    }
+    const { minT, maxT, range } = bounds;
+
+    const timelineWrapEl = document.getElementById('timelineWrap');
+    const latencyWrapEl = document.getElementById('latencyWrap');
+    const containerW = Math.max(timelineWrapEl?.clientWidth || 0, latencyWrapEl?.clientWidth || 0, 1200);
+
+    const maxScale = (MAX_CANVAS_WIDTH - padLeft - padRight) / containerW;
+    if (tlScale > maxScale) {
+        tlScale = maxScale;
+        updateTlZoomUI();
+        updateLatZoomUI();
+    }
+
+    const drawWidth = Math.max(containerW * tlScale, containerW);
+    const W = Math.floor(padLeft + drawWidth + padRight);
+
+    const groupByName = document.getElementById('latGroupByName')?.checked ?? true;
+    let lanes = [];
+    
+    if (groupByName) {
+        const byName = {};
+        for (const r of latencyData) {
+            const name = r.name || 'unknown';
+            if (!byName[name]) byName[name] = [];
+            byName[name].push(r);
+        }
+        for (const [name, records] of Object.entries(byName)) {
+            records.sort((a, b) => a.mark_us - b.mark_us);
+            const nameLanes = [];
+            for (const r of records) {
+                let placed = false;
+                for (const lane of nameLanes) {
+                    const last = lane.blocks[lane.blocks.length - 1];
+                    if (r.mark_us >= last.measure_us) {
+                        lane.blocks.push(r);
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) nameLanes.push({ name, blocks: [r] });
+            }
+            lanes.push(...nameLanes);
+        }
+    } else {
+        lanes = latencyData.map(r => ({ name: r.name, blocks: [r] }));
+    }
+
+    const H = padTop + lanes.length * laneHeight + padBottom;
+    canvas.width = W;
+    canvas.height = H;
+    ctx.clearRect(0, 0, W, H);
+
+    const timeToX = (us) => padLeft + ((us - minT) / range) * drawWidth;
+
+    ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--border-light');
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    for (let i = 0; i <= 10; i++) {
+        const t = minT + (range * i / 10);
+        const x = timeToX(t);
+        ctx.beginPath();
+        ctx.moveTo(x, padTop - 4);
+        ctx.lineTo(x, padTop);
+        ctx.stroke();
+        ctx.fillText(formatLocal(t), x, padTop - 6);
+    }
+
+    latencyLayout = [];
+
+    for (let li = 0; li < lanes.length; li++) {
+        const lane = lanes[li];
+        const y = padTop + li * laneHeight;
+
+        if (li % 2 === 1) {
+            ctx.fillStyle = 'rgba(128,128,128,0.04)';
+            ctx.fillRect(0, y, W, laneHeight);
+        }
+
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-dim');
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'right';
+        const label = lane.name.length > 10 ? lane.name.slice(0, 8) + '..' : lane.name;
+        ctx.fillText(label, padLeft - 6, y + laneHeight / 2 + 4);
+
+        for (const r of lane.blocks) {
+            const xMark = timeToX(r.mark_us);
+            const xClaim = timeToX(r.bind_us);
+            const xMeasure = timeToX(r.measure_us);
+            const w = Math.max(xMeasure - xMark, 2);
+            const baseY = y + laneHeight / 2;
+
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(xMark, baseY);
+            ctx.lineTo(xMeasure, baseY);
+            ctx.stroke();
+
+            ctx.fillStyle = '#10b981';
+            ctx.beginPath();
+            ctx.arc(xMark, baseY, 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            if (r.bind_us && r.bind_us > r.mark_us) {
+                ctx.fillStyle = '#f59e0b';
+                ctx.beginPath();
+                ctx.arc(xClaim, baseY, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.fillStyle = '#ef4444';
+            ctx.beginPath();
+            ctx.arc(xMeasure, baseY, 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = 'rgba(239,68,68,0.3)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(xMark, baseY);
+            ctx.lineTo(xMeasure, baseY);
+            ctx.stroke();
+
+            if (w > 50) {
+                ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text');
+                ctx.font = '10px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(`${r.duration_ms}ms`, xMark + w / 2, baseY - 8);
+            }
+
+            latencyLayout.push({
+                x: xMark,
+                y: y + 2,
+                w: Math.max(xMeasure - xMark, 8),
+                h: laneHeight - 4,
+                record: r
+            });
+        }
+    }
+
+    canvas.onmousemove = (e) => {
+        const mx = e.offsetX;
+        const my = e.offsetY;
+        const hit = latencyLayout.find(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
+
+        if (hit) {
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX + 12) + 'px';
+            tooltip.style.top = (e.clientY - 10) + 'px';
+            const r = hit.record;
+            const tagsMark = r.tags_mark?.length ? ` [${r.tags_mark.join(',')}]` : '';
+            const tagsClaim = r.tags_claim?.length ? ` [${r.tags_claim.join(',')}]` : '';
+            const tagsMeasure = r.tags_measure?.length ? ` [${r.tags_measure.join(',')}]` : '';
+            
+            tooltip.innerHTML =
+                `<div style="font-weight:bold;font-size:12px;color:#fff;margin-bottom:4px;">${r.name}</div>` +
+                `<div style="color:#ef4444;">总延迟: ${r.duration_ms}ms · 认领延迟: ${r.claim_delay_ms}ms</div>` +
+                `<div style="color:var(--text-muted);font-size:10px;margin-top:4px;line-height:1.6;">` +
+                `<span style="color:#10b981;">●</span> mark: ${formatLocal(r.mark_us)}${tagsMark}<br>` +
+                `<span style="color:#f59e0b;">●</span> claim: ${formatLocal(r.bind_us)}${tagsClaim}<br>` +
+                `<span style="color:#ef4444;">●</span> measure: ${formatLocal(r.measure_us)}${tagsMeasure}<br>` +
+                `uid: ${r.uid || '-'} · room: ${r.room || '-'} · trace: ${r.trace_id || '-'}<<br>` +
+                `mark_loc: ${r.mark_loc || '-'}<<br>` +
+                `claim_loc: ${r.claim_loc || '-'}<<br>` +
+                `measure_loc: ${r.measure_loc || '-'}<<br>` +
+                `</div>`;
+            canvas.style.cursor = 'pointer';
+        } else {
+            tooltip.style.display = 'none';
+            canvas.style.cursor = 'default';
+        }
+    };
+    canvas.onmouseleave = () => { tooltip.style.display = 'none'; };
+
+    updateLatZoomUI();
+}
+
 /* ========== 全局刷新 ========== */
 async function refreshAll() {
     await loadFilters();
@@ -815,6 +1209,8 @@ async function refreshAll() {
     loadRawSpans();
     loadTraces();
     loadTimeline();
+    loadLatency();
+    refreshLatencyStats();
 }
 
 let debounceTimer;
@@ -835,7 +1231,3 @@ document.getElementById('pageSize').addEventListener('change', () => { rawOffset
 /* ========== 启动 ========== */
 initTheme();
 loadDates();
-
-
-
-
