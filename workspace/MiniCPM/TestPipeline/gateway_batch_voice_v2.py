@@ -177,6 +177,7 @@ class BatchConfigTemplate:
         self.system_prompt = raw.get("system_prompt", "")
         self.voice_dir = raw.get("voice_dir", "")          # ← 音色目录
         self.voice_paths = raw.get("voice_paths", [])       # ← 额外指定单个文件
+        self.output_dir = raw.get("output_dir", "")          # ← 输出目录
         self.voice_config = raw.get("voice_config", {})
 
 
