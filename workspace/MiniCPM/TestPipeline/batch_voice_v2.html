@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MiniCPM-o 音色克隆批量测试</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f0f2f5; color: #1f2937; line-height: 1.6;
+        }
+        .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+        h1 { font-size: 22px; margin-bottom: 20px; color: #111827; }
+        .layout { display: grid; grid-template-columns: 420px 1fr; gap: 24px; }
+        @media (max-width: 1024px) { .layout { grid-template-columns: 1fr; } }
+
+        .card {
+            background: #fff; border-radius: 10px; padding: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .card h2 { font-size: 16px; margin-bottom: 16px; color: #2563eb; font-weight: 600; }
+        label { display: block; font-size: 13px; color: #4b5563; margin-bottom: 6px; margin-top: 14px; font-weight: 500; }
+        input[type="text"], textarea, select {
+            width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px;
+            font-family: inherit; font-size: 14px; background: #fff;
+        }
+        textarea { min-height: 100px; resize: vertical; }
+        .hint { font-size: 12px; color: #9ca3af; margin-top: 4px; }
+
+        .row { display: flex; gap: 10px; align-items: flex-end; }
+        .row input { flex: 1; }
+        .btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            padding: 10px 18px; background: #2563eb; color: #fff;
+            border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500;
+            transition: background .15s; flex-shrink: 0;
+        }
+        .btn:hover { background: #1d4ed8; }
+        .btn:disabled { background: #9ca3af; cursor: not-allowed; }
+        .btn-secondary { background: #059669; }
+        .btn-secondary:hover { background: #047857; }
+        .btn-warn { background: #f59e0b; color: #fff; }
+        .btn-warn:hover { background: #d97706; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+
+        .file-list {
+            max-height: 240px; overflow-y: auto;
+            border: 1px solid #d1d5db; border-radius: 8px; padding: 8px;
+            background: #fff;
+        }
+        .file-item {
+            display: flex; align-items: center; gap: 10px;
+            padding: 8px; border-radius: 6px; cursor: pointer;
+        }
+        .file-item:hover { background: #f3f4f6; }
+        .file-item input[type="checkbox"] { width: 18px; height: 18px; flex-shrink: 0; }
+        .file-item .name { flex: 1; font-size: 14px; word-break: break-all; }
+        .file-item .play-btn {
+            padding: 4px 10px; font-size: 12px; background: #e5e7eb;
+            border: none; border-radius: 4px; cursor: pointer; flex-shrink: 0;
+        }
+        .file-item .play-btn:hover { background: #d1d5db; }
+
+        .file-stat {
+            margin-top: 10px; padding: 10px 12px; background: #f3f4f6; border-radius: 6px;
+            font-size: 13px; color: #374151;
+        }
+
+        .progress-wrap { margin-top: 20px; }
+        .progress-track {
+            height: 28px; background: #e5e7eb; border-radius: 14px; overflow: hidden;
+        }
+        .progress-bar {
+            height: 100%; background: #2563eb; width: 0%; transition: width .3s;
+            display: flex; align-items: center; justify-content: center;
+            color: #fff; font-size: 12px; font-weight: 600;
+        }
+        .progress-meta {
+            display: flex; justify-content: space-between; margin-top: 8px;
+            font-size: 13px; color: #4b5563;
+        }
+
+        .results { margin-top: 20px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+        th { background: #f9fafb; font-weight: 600; color: #374151; }
+        .status-success { color: #059669; font-weight: 500; }
+        .status-error { color: #dc2626; font-weight: 500; }
+        .status-no_audio { color: #d97706; font-weight: 500; }
+        .status-pending { color: #6b7280; }
+
+        .log {
+            margin-top: 12px; padding: 12px; background: #f3f4f6; border-radius: 6px;
+            font-size: 12px; color: #4b5563; max-height: 160px; overflow-y: auto;
+        }
+        .log div { margin-bottom: 3px; }
+
+        .hidden { display: none !important; }
+
+        .section-divider {
+            margin: 18px 0 12px; border-top: 1px dashed #e5e7eb; padding-top: 8px;
+            font-size: 12px; color: #9ca3af; font-weight: 500;
+        }
+
+        .cartesian-preview {
+            margin-top: 10px; padding: 10px; background: #f0f9ff; border-radius: 6px;
+            font-size: 13px; color: #0369a1;
+        }
+    </style>
+<base target="_blank">
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ 音色克隆批量测试（固定语音 × 批量音色）</h1>
+        <div class="layout">
+            <!-- 左侧：配置 -->
+            <div class="card">
+                <h2>⚙️ 任务配置</h2>
+
+                <label>📜 加载剧本模板（可选）</label>
+                <div class="row">
+                    <select id="templateSelect" onchange="loadTemplate()" style="flex:1;">
+                        <option value="">-- 手动填写 --</option>
+                    </select>
+                    <button class="btn btn-sm btn-warn" onclick="reloadTemplates()">🔄</button>
+                </div>
+
+                <div class="section-divider">固定用户语音</div>
+
+                <label>用户语音目录（服务器本地路径）</label>
+                <div class="row">
+                    <input type="text" id="userAudioDir" placeholder="/data/audio_inputs/questions">
+                    <button class="btn btn-sm" onclick="scanUserDir()">扫描</button>
+                </div>
+                <div class="hint">扫描后显示文件列表，可选择部分文件</div>
+
+                <div id="userFileBox" class="hidden">
+                    <label>选择要测试的用户语音（可多选，留空则全部）</label>
+                    <div class="file-list" id="userFileList"></div>
+                    <div class="row" style="margin-top:8px;">
+                        <button class="btn btn-sm" onclick="selectAll('userFileList')">全选</button>
+                        <button class="btn btn-sm" onclick="clearAll('userFileList')">清空</button>
+                    </div>
+                </div>
+                <div id="userScanResult" class="file-stat hidden"></div>
+
+                <div class="section-divider">批量参考音色</div>
+
+                <label>音色目录（服务器本地路径）</label>
+                <div class="row">
+                    <input type="text" id="voiceDir" placeholder="/data/ref_voices/">
+                    <button class="btn btn-sm" onclick="scanVoiceDir()">扫描</button>
+                </div>
+                <div class="hint">扫描后显示文件列表，可选择部分音色</div>
+
+                <div id="voiceListBox" class="hidden">
+                    <label>选择要测试的音色（可多选，留空则全部）</label>
+                    <div class="file-list" id="voiceList"></div>
+                    <div class="row" style="margin-top:8px;">
+                        <button class="btn btn-sm" onclick="selectAll('voiceList')">全选</button>
+                        <button class="btn btn-sm" onclick="clearAll('voiceList')">清空</button>
+                    </div>
+                </div>
+
+                <label>或额外指定音色文件（逗号分隔，可选）</label>
+                <input type="text" id="voicePaths" placeholder="/data/extra/voice1.wav,/data/extra/voice2.wav">
+
+                <div id="cartesianPreview" class="cartesian-preview hidden"></div>
+
+                <div class="section-divider">输出配置</div>
+
+                <label>输出目录（服务器本地路径，可选）</label>
+                <input type="text" id="outputDir" placeholder="/data/outputs/voice_test_01">
+                <div class="hint">留空则自动生成；指定后音频和 manifest.json 会放在此目录</div>
+
+                <div class="section-divider">Prompt 与参数</div>
+
+                <label>System Prompt（AI 人设）</label>
+                <textarea id="systemPrompt">你是一位乐于助人的助手。请用自然的中文语音回答用户的问题。</textarea>
+
+                <label>语音配置（Voice Config JSON，可选）</label>
+                <input type="text" id="voiceConfig" placeholder='{"temperature": 0.7}'>
+
+                <button class="btn" id="startBtn" onclick="startBatch()" style="width:100%;margin-top:18px;">
+                    ▶️ 开始批量测试
+                </button>
+
+                <div class="log" id="logBox"><div>等待配置...</div></div>
+            </div>
+
+            <!-- 右侧：进度与结果 -->
+            <div class="card">
+                <h2>📊 任务进度</h2>
+
+                <div id="progressArea" class="hidden">
+                    <div class="progress-track">
+                        <div class="progress-bar" id="progressFill">0%</div>
+                    </div>
+                    <div class="progress-meta">
+                        <span id="progressText">0 / 0</span>
+                        <span id="statusText">等待中</span>
+                    </div>
+                </div>
+
+                <div id="resultsArea" class="results hidden">
+                    <h2 style="font-size:15px;color:#111827;margin-bottom:10px;">📋 处理结果</h2>
+                    <div style="overflow-x:auto;">
+                        <table>
+                            <thead>
+                                <tr><th>用户语音</th><th>测试音色</th><th style="width:80px">状态</th><th style="width:220px">输出音频</th><th>文本</th></tr>
+                            </thead>
+                            <tbody id="resultsBody"></tbody>
+                        </table>
+                    </div>
+                    <div style="display:flex;gap:10px;margin-top:16px;">
+                        <button class="btn btn-secondary" id="downloadBtn" onclick="downloadResults()">⬇️ 下载 ZIP</button>
+                        <button class="btn" id="manifestBtn" style="background:#7c3aed;" onclick="downloadManifest()">📋 manifest.json</button>
+                    </div>
+                </div>
+
+                <div id="emptyState" style="text-align:center;padding:60px 20px;color:#9ca3af;">
+                    <div style="font-size:48px;margin-bottom:12px;">📁</div>
+                    <div>配置左侧参数并点击"开始批量测试"</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ========== 全局状态（只声明一次） ==========
+        let currentJobId = null;
+        let templates = [];
+        let userFiles = [];      // 扫描到的用户语音
+        let voiceFiles = [];     // 扫描到的音色
+
+        // ========== 初始化 ==========
+        async function init() {
+            await loadTemplates();
+            log("初始化完成");
+        }
+
+        // ========== 工具函数 ==========
+        function log(msg) {
+            const box = document.getElementById('logBox');
+            const line = document.createElement('div');
+            line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            box.appendChild(line);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        function getCheckedValues(listId) {
+            return Array.from(document.querySelectorAll(`#${listId} input[type="checkbox"]:checked`)).map(cb => cb.value);
+        }
+
+        function selectAll(listId) {
+            document.querySelectorAll(`#${listId} input[type="checkbox"]`).forEach(cb => cb.checked = true);
+            updateCartesian();
+        }
+
+        function clearAll(listId) {
+            document.querySelectorAll(`#${listId} input[type="checkbox"]`).forEach(cb => cb.checked = false);
+            updateCartesian();
+        }
+
+        function toggleCheckbox(idx, listId) {
+            const cb = document.getElementById(`${listId}_cb_${idx}`);
+            cb.checked = !cb.checked;
+            updateCartesian();
+        }
+
+        // ========== 剧本模板 ==========
+        async function loadTemplates() {
+            try {
+                const res = await fetch('/api/batch_configs');
+                const data = await res.json();
+                templates = data.configs || [];
+                const sel = document.getElementById('templateSelect');
+                sel.innerHTML = '<option value="">-- 手动填写 --</option>';
+                templates.forEach(t => {
+                    const opt = document.createElement('option');
+                    opt.value = t.id;
+                    opt.textContent = t.name;
+                    sel.appendChild(opt);
+                });
+            } catch (e) {
+                log('模板加载失败: ' + e.message);
+            }
+        }
+
+        async function reloadTemplates() {
+            log('热重载...');
+            try {
+                const res = await fetch('/api/batch_configs/reload', {method: 'POST'});
+                const data = await res.json();
+                if (data.success) {
+                    log(`重载完成: ${data.count} 个`);
+                    await loadTemplates();
+                }
+            } catch (e) {
+                log('重载失败: ' + e.message);
+            }
+        }
+
+        async function loadTemplate() {
+            const tid = document.getElementById('templateSelect').value;
+            if (!tid) return;
+            try {
+                const res = await fetch(`/api/batch_configs/${tid}`);
+                const t = await res.json();
+                if (!res.ok) throw new Error(t.detail);
+
+                if (t.user_audio_dir) {
+                    document.getElementById('userAudioDir').value = t.user_audio_dir;
+                    await scanUserDir();
+                }
+                if (t.voice_dir) {
+                    document.getElementById('voiceDir').value = t.voice_dir;
+                    await scanVoiceDir();
+                }
+                if (t.output_dir) document.getElementById('outputDir').value = t.output_dir;
+                if (t.system_prompt) document.getElementById('systemPrompt').value = t.system_prompt;
+                if (t.voice_config && Object.keys(t.voice_config).length > 0) {
+                    document.getElementById('voiceConfig').value = JSON.stringify(t.voice_config);
+                }
+                log(`已加载: ${t.name}`);
+            } catch (e) {
+                log('加载失败: ' + e.message);
+            }
+        }
+
+        // ========== 扫描用户语音 ==========
+        async function scanUserDir() {
+            const dir = document.getElementById('userAudioDir').value.trim();
+            if (!dir) { alert('请输入用户语音目录路径'); return; }
+            log(`扫描用户语音: ${dir}...`);
+            try {
+                const res = await fetch(`/api/scan_user_audios?user_audio_dir=${encodeURIComponent(dir)}`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail);
+
+                userFiles = data.files || [];
+                renderFileList('userFileList', userFiles, 'user');
+                document.getElementById('userFileBox').classList.remove('hidden');
+                document.getElementById('userScanResult').classList.remove('hidden');
+                document.getElementById('userScanResult').textContent = `扫描完成: ${data.count} 个文件`;
+                log(`用户语音: ${data.count} 个`);
+                updateCartesian();
+            } catch (e) {
+                log('扫描失败: ' + e.message);
+            }
+        }
+
+        // ========== 扫描音色 ==========
+        async function scanVoiceDir() {
+            const dir = document.getElementById('voiceDir').value.trim();
+            if (!dir) { alert('请输入音色目录路径'); return; }
+            log(`扫描音色: ${dir}...`);
+            try {
+                const res = await fetch(`/api/scan_voices?voice_dir=${encodeURIComponent(dir)}`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail);
+
+                voiceFiles = data.voices || [];
+                renderFileList('voiceList', voiceFiles, 'voice');
+                document.getElementById('voiceListBox').classList.remove('hidden');
+                log(`音色: ${data.count} 个`);
+                updateCartesian();
+            } catch (e) {
+                log('扫描失败: ' + e.message);
+            }
+        }
+
+        // ========== 渲染文件列表 ==========
+        function renderFileList(containerId, files, prefix) {
+            const box = document.getElementById(containerId);
+            if (files.length === 0) {
+                box.innerHTML = '<div style="color:#9ca3af;text-align:center;padding:20px;">目录为空</div>';
+                return;
+            }
+            box.innerHTML = files.map((item, i) => {
+                const isVoice = prefix === 'voice';
+                const playBtn = isVoice
+                    ? `<button class="play-btn" onclick="event.stopPropagation(); previewVoice('${encodeURIComponent(item.path)}')">▶ 试听</button>`
+                    : '';
+                return `
+                    <div class="file-item" onclick="toggleCheckbox('${prefix}_${i}', '${containerId}')">
+                        <input type="checkbox" id="${containerId}_cb_${prefix}_${i}" value="${item.path}" onchange="updateCartesian()">
+                        <span class="name">${item.name}</span>
+                        ${playBtn}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function previewVoice(path) {
+            new Audio(`/api/voice_preview?path=${path}`).play();
+        }
+
+        // ========== 笛卡尔积预览 ==========
+        function updateCartesian() {
+            const selVoices = getCheckedValues('voiceList');
+            const selUsers = getCheckedValues('userFileList');
+            const extraPaths = document.getElementById('voicePaths').value.trim();
+            const preview = document.getElementById('cartesianPreview');
+
+            const extraCount = extraPaths ? extraPaths.split(',').filter(v => v.trim()).length : 0;
+            const totalVoices = selVoices.length + extraCount;
+            const totalUsers = selUsers.length || userFiles.length || 0;
+
+            if (totalVoices === 0 || totalUsers === 0) {
+                preview.classList.add('hidden');
+                return;
+            }
+            preview.classList.remove('hidden');
+            const userLabel = selUsers.length > 0 ? `${selUsers.length} 个` : `${userFiles.length} 个(全部)`;
+            preview.innerHTML = `将生成 <b>${totalVoices * totalUsers}</b> 个样本（${userLabel} 语音 × ${totalVoices} 个音色）`;
+        }
+
+        // ========== 开始批量任务 ==========
+        async function startBatch() {
+            const userDir = document.getElementById('userAudioDir').value.trim();
+            const voiceDir = document.getElementById('voiceDir').value.trim();
+            const systemPrompt = document.getElementById('systemPrompt').value;
+            const voiceConfig = document.getElementById('voiceConfig').value.trim();
+            const extraPaths = document.getElementById('voicePaths').value.trim();
+            const outputDir = document.getElementById('outputDir').value.trim();
+
+            if (!userDir) { alert('请输入用户语音目录路径'); return; }
+
+            const selVoices = getCheckedValues('voiceList');
+            if (selVoices.length === 0 && !extraPaths && !voiceDir) {
+                alert('请至少选择一个音色'); return;
+            }
+
+            const selUsers = getCheckedValues('userFileList');
+
+            const form = new FormData();
+            form.append('user_audio_dir', userDir);
+            form.append('system_prompt', systemPrompt);
+            if (voiceDir) form.append('voice_dir', voiceDir);
+            if (extraPaths) form.append('voice_paths', extraPaths);
+            if (outputDir) form.append('output_dir', outputDir);
+            if (selUsers.length > 0) form.append('selected_user_files', selUsers.join(','));
+            if (selVoices.length > 0) form.append('selected_voice_files', selVoices.join(','));
+            form.append('voice_config_json', voiceConfig || '{}');
+
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('emptyState').classList.add('hidden');
+            document.getElementById('progressArea').classList.remove('hidden');
+            document.getElementById('resultsArea').classList.add('hidden');
+            document.getElementById('downloadBtn').classList.add('hidden');
+            log('创建任务...');
+
+            try {
+                const res = await fetch('/api/batch/jobs', {method: 'POST', body: form});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || '创建失败');
+                currentJobId = data.job_id;
+                log(`任务: ${currentJobId}, ${data.total_tasks} 个样本`);
+                pollStatus();
+            } catch (e) {
+                log(`错误: ${e.message}`);
+                document.getElementById('startBtn').disabled = false;
+            }
+        }
+
+        // ========== 轮询进度 ==========
+        async function pollStatus() {
+            if (!currentJobId) return;
+            try {
+                const res = await fetch(`/api/batch/jobs/${currentJobId}`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail);
+
+                const pct = data.total > 0 ? Math.round((data.progress / data.total) * 100) : 0;
+                document.getElementById('progressFill').style.width = pct + '%';
+                document.getElementById('progressFill').textContent = pct + '%';
+                document.getElementById('progressText').textContent = `${data.progress} / ${data.total}`;
+                document.getElementById('statusText').textContent =
+                    data.status === 'running' ? '处理中...' :
+                    data.status === 'completed' ? '已完成' : data.status;
+
+                if (data.results && data.results.length > 0) {
+                    renderResults(data.results);
+                }
+
+                if (data.status === 'completed' || data.status === 'failed') {
+                    document.getElementById('startBtn').disabled = false;
+                    log(`结束: ${data.status}`);
+                    if (data.status === 'completed') {
+                        document.getElementById('downloadBtn').classList.remove('hidden');
+                        if (data.manifest_path) log(`manifest: ${data.manifest_path}`);
+                    }
+                    return;
+                }
+                setTimeout(pollStatus, 1000);
+            } catch (e) {
+                log(`轮询错误: ${e.message}`);
+                setTimeout(pollStatus, 3000);
+            }
+        }
+
+        function renderResults(results) {
+            const tbody = document.getElementById('resultsBody');
+            document.getElementById('resultsArea').classList.remove('hidden');
+            tbody.innerHTML = results.map(r => {
+                let cls = 'status-pending', txt = '等待';
+                if (r.status === 'success') { cls = 'status-success'; txt = '成功'; }
+                else if (r.status === 'error') { cls = 'status-error'; txt = '失败'; }
+                else if (r.status === 'no_audio') { cls = 'status-no_audio'; txt = '无音频'; }
+
+                const audio = (r.status === 'success' && r.output)
+                    ? `<audio controls src="/api/batch/jobs/${currentJobId}/outputs/${encodeURIComponent(r.output)}" style="width:100%;height:32px;"></audio>`
+                    : '<span style="color:#9ca3af">-</span>';
+
+                return `<tr>
+                    <td style="word-break:break-all;">${r.input}</td>
+                    <td>${r.voice}</td>
+                    <td class="${cls}">${txt}</td>
+                    <td>${audio}</td>
+                    <td style="word-break:break-all;max-width:300px;">${r.text || ''}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        function downloadResults() {
+            if (currentJobId) window.location.href = `/api/batch/jobs/${currentJobId}/download`;
+        }
+
+        function downloadManifest() {
+            if (currentJobId) window.open(`/api/batch/jobs/${currentJobId}/manifest`, '_blank');
+        }
+
+        // 启动
+        init();
+    </script>
+</body>
+</html>
