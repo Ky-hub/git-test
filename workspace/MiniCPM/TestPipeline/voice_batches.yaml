@@ -1,0 +1,40 @@
+# ============================================================
+# MiniCPM-o 音色克隆批量测试 —— 剧本模板配置
+# ============================================================
+# 一个文件可定义多个剧本模板，前端通过下拉框选择后自动填充参数
+
+batch_templates:
+  - id: "test_all_voices"
+    name: "测试全部音色（固定问题）"
+    user_audio_dir: "/data/audio_inputs/fixed_questions"   # 固定用户语音目录
+    system_prompt: "你是一位乐于助人的助手。请用自然的中文语音回答用户的问题。"
+    voice_dir: "/data/ref_voices/"                          # 音色目录（自动扫描）
+    output_dir: "/data/outputs/voice_clone_batch_01"       # ← 输出目录（服务器本地路径）
+    voice_config:
+      temperature: 0.7
+      top_p: 0.9
+
+  - id: "female_set_test"
+    name: "女声集合测试"
+    user_audio_dir: "/data/audio_inputs/questions"
+    system_prompt: "你是一位温柔的女助手。"
+    voice_dir: "/data/ref_voices/female_set/"
+    output_dir: "/data/outputs/female_comparison"
+    voice_config:
+      temperature: 0.7
+
+  - id: "abx_test"
+    name: "ABX 盲测对比"
+    user_audio_dir: "/data/audio_inputs/abx_prompts"
+    system_prompt: "请用自然的语气回答。"
+    voice_dir: "/data/ref_voices/abx_candidates/"
+    output_dir: "/data/outputs/abx_results"
+    voice_config: {}
+
+  - id: "empty"
+    name: "（手动填写）"
+    user_audio_dir: ""
+    system_prompt: ""
+    voice_dir: ""
+    output_dir: ""
+    voice_config: {}
