@@ -43,10 +43,9 @@ function syncScroll(sourceId, targetId) {
     });
 }
 
-/* ========== 统一渲染 + 滚动对齐 ========== */
+/* ========== 统一渲染入口 ========== */
 function syncRender() {
-    renderTimeline();
-    renderLatencyTimeline();
+    renderUnified();
     const tWrap = document.getElementById('timelineWrap');
     const lWrap = document.getElementById('latencyWrap');
     if (tWrap && lWrap) lWrap.scrollLeft = tWrap.scrollLeft;
@@ -106,7 +105,7 @@ function handleWheel(e, sourceId) {
     syncRender();
 }
 
-/* ========== 时区工具 ========== */
+/* ========== 时区工具（精确到毫秒） ========== */
 function getTzOffsetMinutes(tz) {
     if (tz === 'UTC') return 0;
     if (tz === 'local') return -new Date().getTimezoneOffset();
@@ -124,19 +123,31 @@ function formatLocal(us) {
         const h = d.getUTCHours().toString().padStart(2,'0');
         const m = d.getUTCMinutes().toString().padStart(2,'0');
         const s = d.getUTCSeconds().toString().padStart(2,'0');
-        return `${h}:${m}:${s}`;
+        const milli = d.getUTCMilliseconds().toString().padStart(3,'0');
+        return `${h}:${m}:${s}.${milli}`;
     }
     if (currentTz === 'local') {
-        return new Date(ms).toLocaleTimeString();
+        const d = new Date(ms);
+        const h = d.getHours().toString().padStart(2,'0');
+        const m = d.getMinutes().toString().padStart(2,'0');
+        const s = d.getSeconds().toString().padStart(2,'0');
+        const milli = d.getMilliseconds().toString().padStart(3,'0');
+        return `${h}:${m}:${s}.${milli}`;
     }
     try {
-        return new Date(ms).toLocaleTimeString('zh-CN', {
-            timeZone: currentTz, hour12: false,
-            hour: '2-digit', minute: '2-digit', second: '2-digit'
-        });
+        const d = new Date(ms);
+        const h = d.getHours().toString().padStart(2,'0');
+        const m = d.getMinutes().toString().padStart(2,'0');
+        const s = d.getSeconds().toString().padStart(2,'0');
+        const milli = d.getMilliseconds().toString().padStart(3,'0');
+        return `${h}:${m}:${s}.${milli}`;
     } catch (e) {
         const d = new Date(ms);
-        return `${d.getUTCHours().toString().padStart(2,'0')}:${d.getUTCMinutes().toString().padStart(2,'0')}:${d.getUTCSeconds().toString().padStart(2,'0')}`;
+        const h = d.getUTCHours().toString().padStart(2,'0');
+        const m = d.getUTCMinutes().toString().padStart(2,'0');
+        const s = d.getUTCSeconds().toString().padStart(2,'0');
+        const milli = d.getUTCMilliseconds().toString().padStart(3,'0');
+        return `${h}:${m}:${s}.${milli}`;
     }
 }
 
@@ -743,7 +754,7 @@ function jumpToPage() {
     loadRawSpans();
 }
 
-/* ========== 主 Timeline 时序视图 ========== */
+/* ========== 数据加载 ========== */
 async function loadTimeline() {
     if (!currentDate) return;
     const n = document.getElementById('nameFilter').value.trim();
@@ -759,17 +770,51 @@ async function loadTimeline() {
         timelineData = await res.json();
         window._cachedLanes = null;
         window._cachedLaneKey = null;
-        renderTimeline();
+        renderUnified();
     } catch (e) { console.error('timeline load failed', e); }
 }
 
-function renderTimeline() {
+async function loadLatency() {
+    if (!currentDate) return;
+    const n = document.getElementById('nameFilter').value.trim();
+    const t = document.getElementById('tagFilter').value.trim();
+    const r = document.getElementById('roomFilter').value.trim();
+    let url = `/api/latency_timeline?date=${currentDate}&start_min=${sliderStartMin}&end_min=${sliderEndMin}`;
+    if (n) url += '&name=' + encodeURIComponent(n);
+    if (t) url += '&tag=' + encodeURIComponent(t);
+    if (r) url += '&room=' + encodeURIComponent(r);
+
+    try {
+        const res = await fetch(url);
+        latencyData = await res.json();
+        renderUnified();
+        // 在第二个 Canvas 画提示
+        const canvas = document.getElementById('latencyCanvas');
+        const wrap = document.getElementById('latencyWrap');
+        if (canvas && wrap) {
+            const ctx = canvas.getContext('2d');
+            canvas.width = wrap.clientWidth || 800;
+            canvas.height = 40;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
+            ctx.textAlign = 'center';
+            ctx.font = '12px monospace';
+            ctx.fillText('↑ Latency 数据已合并到上方 Timeline', canvas.width / 2, 25);
+        }
+    } catch (e) { console.error('latency load failed', e); }
+}
+
+/* ========== 统一 Timeline 渲染（主 spans + Latency 合并） ========== */
+function renderUnified() {
     const canvas = document.getElementById('timelineCanvas');
     const wrap = document.getElementById('timelineWrap');
     const ctx = canvas.getContext('2d');
     const tooltip = document.getElementById('timelineTooltip');
 
-    if (!timelineData.length && !latencyData.length) {
+    const hasSpans = timelineData && timelineData.length > 0;
+    const hasLatency = latencyData && latencyData.length > 0;
+
+    if (!hasSpans && !hasLatency) {
         canvas.width = wrap.clientWidth || 800;
         canvas.height = 60;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -781,51 +826,21 @@ function renderTimeline() {
     }
 
     const bounds = computeUnifiedBounds();
-    if (!bounds) {
-        canvas.width = wrap.clientWidth || 800;
-        canvas.height = 60;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
-        ctx.textAlign = 'center';
-        ctx.font = '13px monospace';
-        ctx.fillText('当前时间段无数据', canvas.width / 2, 35);
-        return;
-    }
+    if (!bounds) return;
     const { minT, maxT, range } = bounds;
-
-    const laneKey = timelineData.length + '_' + (timelineData[0]?.trace || '') + '_' + (timelineData[timelineData.length - 1]?.trace || '');
-    if (!window._cachedLanes || window._cachedLaneKey !== laneKey) {
-        const sorted = [...timelineData].sort((a, b) => a.start_us - b.start_us);
-        const lanes = [];
-        for (const span of sorted) {
-            const spanEnd = span.start_us + Math.round(span.ms * 1000);
-            let placed = false;
-            for (const lane of lanes) {
-                const last = lane.blocks[lane.blocks.length - 1];
-                const lastEnd = last.start_us + Math.round(last.ms * 1000);
-                if (span.start_us >= lastEnd) {
-                    lane.blocks.push(span);
-                    placed = true;
-                    break;
-                }
-            }
-            if (!placed) lanes.push({ blocks: [span] });
-        }
-        window._cachedLanes = lanes;
-        window._cachedLaneKey = laneKey;
-    }
-    const lanes = window._cachedLanes;
-
-    const padLeft = 80;
-    const padRight = 10;
-    const padTop = 24;
-    const padBottom = 8;
-    const laneHeight = 20;
-    const MAX_CANVAS_WIDTH = 30000;
 
     const timelineWrapEl = document.getElementById('timelineWrap');
     const latencyWrapEl = document.getElementById('latencyWrap');
     const containerW = Math.max(timelineWrapEl?.clientWidth || 0, latencyWrapEl?.clientWidth || 0, 1200);
+
+    const padLeft = 80;
+    const padRight = 10;
+    const padTop = 24;
+    const mainLaneHeight = 20;
+    const gap = 50;          // 引线区高度
+    const latLaneHeight = 28;
+    const padBottom = 8;
+    const MAX_CANVAS_WIDTH = 30000;
 
     const maxScale = (MAX_CANVAS_WIDTH - padLeft - padRight) / containerW;
     if (tlScale > maxScale) {
@@ -836,7 +851,64 @@ function renderTimeline() {
 
     const drawWidth = Math.max(containerW * tlScale, containerW);
     const W = Math.floor(padLeft + drawWidth + padRight);
-    const H = padTop + lanes.length * laneHeight + padBottom;
+
+    // 主泳道分配
+    let mainLanes = [];
+    if (hasSpans) {
+        const sorted = [...timelineData].sort((a, b) => a.start_us - b.start_us);
+        for (const span of sorted) {
+            const spanEnd = span.start_us + Math.round(span.ms * 1000);
+            let placed = false;
+            for (const lane of mainLanes) {
+                const last = lane.blocks[lane.blocks.length - 1];
+                const lastEnd = last.start_us + Math.round(last.ms * 1000);
+                if (span.start_us >= lastEnd) {
+                    lane.blocks.push(span);
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) mainLanes.push({ blocks: [span] });
+        }
+    }
+
+    // Latency 泳道分配
+    let latLanes = [];
+    if (hasLatency) {
+        const groupByName = document.getElementById('latGroupByName')?.checked ?? true;
+        if (groupByName) {
+            const byName = {};
+            for (const r of latencyData) {
+                const name = r.name || 'unknown';
+                if (!byName[name]) byName[name] = [];
+                byName[name].push(r);
+            }
+            for (const [name, records] of Object.entries(byName)) {
+                records.sort((a, b) => a.mark_us - b.mark_us);
+                const nameLanes = [];
+                for (const r of records) {
+                    let placed = false;
+                    for (const lane of nameLanes) {
+                        const last = lane.blocks[lane.blocks.length - 1];
+                        if (r.mark_us >= last.measure_us) {
+                            lane.blocks.push(r);
+                            placed = true;
+                            break;
+                        }
+                    }
+                    if (!placed) nameLanes.push({ name, blocks: [r] });
+                }
+                latLanes.push(...nameLanes);
+            }
+        } else {
+            latLanes = latencyData.map(r => ({ name: r.name, blocks: [r] }));
+        }
+    }
+
+    const mainHeight = mainLanes.length * mainLaneHeight;
+    const latTop = padTop + mainHeight + gap;
+    const latHeight = latLanes.length * latLaneHeight;
+    const H = latTop + latHeight + padBottom;
 
     canvas.width = W;
     canvas.height = H;
@@ -844,11 +916,11 @@ function renderTimeline() {
 
     const timeToX = (us) => padLeft + ((us - minT) / range) * drawWidth;
 
+    // 刻度
     ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--border-light');
     ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
     ctx.font = '10px monospace';
     ctx.textAlign = 'center';
-
     for (let i = 0; i <= 10; i++) {
         const t = minT + (range * i / 10);
         const x = timeToX(t);
@@ -859,15 +931,17 @@ function renderTimeline() {
         ctx.fillText(formatLocal(t), x, padTop - 6);
     }
 
+    // 画主 spans
     timelineLayout = [];
+    const spanTraceMap = new Map();
 
-    for (let li = 0; li < lanes.length; li++) {
-        const lane = lanes[li];
-        const y = padTop + li * laneHeight;
+    for (let li = 0; li < mainLanes.length; li++) {
+        const lane = mainLanes[li];
+        const y = padTop + li * mainLaneHeight;
 
         if (li % 2 === 1) {
             ctx.fillStyle = 'rgba(128,128,128,0.04)';
-            ctx.fillRect(0, y, W, laneHeight);
+            ctx.fillRect(0, y, W, mainLaneHeight);
         }
 
         for (const span of lane.blocks) {
@@ -877,12 +951,12 @@ function renderTimeline() {
 
             ctx.fillStyle = color;
             ctx.globalAlpha = 0.85;
-            ctx.fillRect(x, y + 1, w, laneHeight - 2);
+            ctx.fillRect(x, y + 1, w, mainLaneHeight - 2);
             ctx.globalAlpha = 1;
 
             ctx.strokeStyle = 'rgba(0,0,0,0.3)';
             ctx.lineWidth = 1;
-            ctx.strokeRect(x, y + 1, w, laneHeight - 2);
+            ctx.strokeRect(x, y + 1, w, mainLaneHeight - 2);
 
             if (w > 40) {
                 ctx.fillStyle = '#000';
@@ -892,35 +966,196 @@ function renderTimeline() {
                 ctx.fillText(txt, x + 3, y + 14);
             }
 
-            timelineLayout.push({ x, y: y + 1, w, h: laneHeight - 2, span });
+            const yCenter = y + mainLaneHeight / 2;
+            spanTraceMap.set(span.trace, { yCenter, xStart: x, xEnd: x + w, span });
+            timelineLayout.push({ x, y: y + 1, w, h: mainLaneHeight - 2, span });
         }
     }
 
+    // 引线区背景
+    if (hasSpans && hasLatency) {
+        ctx.fillStyle = 'rgba(128,128,128,0.02)';
+        ctx.fillRect(0, padTop + mainHeight, W, gap);
+    }
+
+    // 画 Latency（底部）
+    latencyLayout = [];
+
+    for (let li = 0; li < latLanes.length; li++) {
+        const lane = latLanes[li];
+        const y = latTop + li * latLaneHeight;
+
+        if (li % 2 === 1) {
+            ctx.fillStyle = 'rgba(128,128,128,0.04)';
+            ctx.fillRect(0, y, W, latLaneHeight);
+        }
+
+        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-dim');
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'right';
+        const label = lane.name.length > 10 ? lane.name.slice(0, 8) + '..' : lane.name;
+        ctx.fillText(label, padLeft - 6, y + latLaneHeight / 2 + 4);
+
+        for (const r of lane.blocks) {
+            const xMark = timeToX(r.mark_us);
+            const xClaim = timeToX(r.bind_us);
+            const xMeasure = timeToX(r.measure_us);
+            const w = Math.max(xMeasure - xMark, 2);
+            const baseY = y + latLaneHeight / 2;
+
+            // 基线
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(xMark, baseY);
+            ctx.lineTo(xMeasure, baseY);
+            ctx.stroke();
+
+            // Mark（绿）
+            ctx.fillStyle = '#10b981';
+            ctx.beginPath();
+            ctx.arc(xMark, baseY, 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Claim（黄）
+            if (r.bind_us && r.bind_us > r.mark_us) {
+                ctx.fillStyle = '#f59e0b';
+                ctx.beginPath();
+                ctx.arc(xClaim, baseY, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Measure（红）
+            ctx.fillStyle = '#ef4444';
+            ctx.beginPath();
+            ctx.arc(xMeasure, baseY, 4, 0, Math.PI * 2);
+            ctx.fill();
+
+            // 连线 mark->measure
+            ctx.strokeStyle = 'rgba(239,68,68,0.3)';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(xMark, baseY);
+            ctx.lineTo(xMeasure, baseY);
+            ctx.stroke();
+
+            // 标注 duration
+            if (w > 50) {
+                ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text');
+                ctx.font = '10px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(`${r.duration_ms}ms`, xMark + w / 2, baseY - 8);
+            }
+
+            // ===== 三个端点都向上画垂直引线（粗略对齐） =====
+            const spanInfo = spanTraceMap.get(r.trace_id);
+            const targetY = spanInfo ? spanInfo.yCenter : padTop;
+
+            ctx.setLineDash([2, 3]);
+            ctx.lineWidth = 1;
+
+            // mark 垂线（绿）
+            ctx.strokeStyle = 'rgba(16,185,129,0.25)';
+            ctx.beginPath();
+            ctx.moveTo(xMark, baseY);
+            ctx.lineTo(xMark, targetY);
+            ctx.stroke();
+
+            // claim 垂线（黄）
+            if (r.bind_us && r.bind_us > r.mark_us) {
+                ctx.strokeStyle = 'rgba(245,158,11,0.25)';
+                ctx.beginPath();
+                ctx.moveTo(xClaim, baseY);
+                ctx.lineTo(xClaim, targetY);
+                ctx.stroke();
+            }
+
+            // measure 垂线（红）
+            ctx.strokeStyle = 'rgba(239,68,68,0.25)';
+            ctx.beginPath();
+            ctx.moveTo(xMeasure, baseY);
+            ctx.lineTo(xMeasure, targetY);
+            ctx.stroke();
+
+            ctx.setLineDash([]);
+
+            // 在 targetY 处画小圆点标记
+            ctx.fillStyle = '#10b981';
+            ctx.beginPath();
+            ctx.arc(xMark, targetY, 2, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#ef4444';
+            ctx.beginPath();
+            ctx.arc(xMeasure, targetY, 2, 0, Math.PI * 2);
+            ctx.fill();
+
+            latencyLayout.push({
+                x: xMark,
+                y: y + 2,
+                w: Math.max(xMeasure - xMark, 8),
+                h: latLaneHeight - 4,
+                record: r
+            });
+        }
+    }
+
+    // 交互事件
     canvas.onmousemove = (e) => {
         const mx = e.offsetX;
         const my = e.offsetY;
-        const hit = timelineLayout.find(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
 
-        if (hit) {
+        // 优先检查主 span
+        const hitSpan = timelineLayout.find(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
+        if (hitSpan) {
             tooltip.style.display = 'block';
             tooltip.style.left = (e.clientX + 12) + 'px';
             tooltip.style.top = (e.clientY - 10) + 'px';
-            const s = hit.span;
+            const s = hitSpan.span;
             const tagsStr = s.tags && s.tags.length ? ` [${s.tags.join(',')}]` : '';
             const uidStr = s.uid ? ` uid=${s.uid}` : '';
             const roomStr = s.room ? ` room=${s.room}` : '';
 
             tooltip.innerHTML =
                 `<div style="font-weight:bold;font-size:12px;color:#fff;margin-bottom:4px;">${s.name}</div>` +
-                `<div style="color:var(--accent);">${s.ms}ms · ${formatLocal(s.start_us)}</div>` +
+                `<div style="color:var(--accent);">${s.ms}ms</div>` +
                 `<div style="color:var(--text-muted);font-size:10px;margin-top:4px;">` +
+                `开始: ${formatLocal(s.start_us)}<<br>` +
+                `结束: ${formatLocal(s.end_us)}<<br>` +
                 `trace: ${s.trace}${tagsStr}${uidStr}${roomStr}` +
                 `</div>`;
             canvas.style.cursor = 'pointer';
-        } else {
-            tooltip.style.display = 'none';
-            canvas.style.cursor = 'default';
+            return;
         }
+
+        // 检查 latency
+        const hitLat = latencyLayout.find(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
+        if (hitLat) {
+            tooltip.style.display = 'block';
+            tooltip.style.left = (e.clientX + 12) + 'px';
+            tooltip.style.top = (e.clientY - 10) + 'px';
+            const r = hitLat.record;
+            const tagsMark = r.tags_mark?.length ? ` [${r.tags_mark.join(',')}]` : '';
+            const tagsClaim = r.tags_claim?.length ? ` [${r.tags_claim.join(',')}]` : '';
+            const tagsMeasure = r.tags_measure?.length ? ` [${r.tags_measure.join(',')}]` : '';
+            
+            tooltip.innerHTML =
+                `<div style="font-weight:bold;font-size:12px;color:#fff;margin-bottom:4px;">${r.name}</div>` +
+                `<div style="color:#ef4444;">总延迟: ${r.duration_ms}ms · 认领延迟: ${r.claim_delay_ms}ms</div>` +
+                `<div style="color:var(--text-muted);font-size:10px;margin-top:4px;line-height:1.6;">` +
+                `<span style="color:#10b981;">●</span> mark: ${formatLocal(r.mark_us)}${tagsMark}<br>` +
+                `<span style="color:#f59e0b;">●</span> claim: ${formatLocal(r.bind_us)}${tagsClaim}<br>` +
+                `<span style="color:#ef4444;">●</span> measure: ${formatLocal(r.measure_us)}${tagsMeasure}<br>` +
+                `uid: ${r.uid || '-'} · room: ${r.room || '-'} · trace: ${r.trace_id || '-'}<<br>` +
+                `mark_loc: ${r.mark_loc || '-'}<<br>` +
+                `claim_loc: ${r.claim_loc || '-'}<<br>` +
+                `measure_loc: ${r.measure_loc || '-'}<<br>` +
+                `</div>`;
+            canvas.style.cursor = 'pointer';
+            return;
+        }
+
+        tooltip.style.display = 'none';
+        canvas.style.cursor = 'default';
     };
     canvas.onmouseleave = () => { tooltip.style.display = 'none'; };
     canvas.onclick = (e) => {
@@ -931,6 +1166,7 @@ function renderTimeline() {
     };
 
     updateTlZoomUI();
+    updateLatZoomUI();
 }
 
 function nameToColor(name) {
@@ -970,236 +1206,6 @@ async function refreshLatencyStats() {
             tbody.appendChild(tr);
         });
     } catch (e) { console.error(e); }
-}
-
-/* ========== Latency Timeline ========== */
-async function loadLatency() {
-    if (!currentDate) return;
-    const n = document.getElementById('nameFilter').value.trim();
-    const t = document.getElementById('tagFilter').value.trim();
-    const r = document.getElementById('roomFilter').value.trim();
-    let url = `/api/latency_timeline?date=${currentDate}&start_min=${sliderStartMin}&end_min=${sliderEndMin}`;
-    if (n) url += '&name=' + encodeURIComponent(n);
-    if (t) url += '&tag=' + encodeURIComponent(t);
-    if (r) url += '&room=' + encodeURIComponent(r);
-
-    try {
-        const res = await fetch(url);
-        latencyData = await res.json();
-        renderLatencyTimeline();
-    } catch (e) { console.error('latency load failed', e); }
-}
-
-function renderLatencyTimeline() {
-    const canvas = document.getElementById('latencyCanvas');
-    const wrap = document.getElementById('latencyWrap');
-    const ctx = canvas.getContext('2d');
-    const tooltip = document.getElementById('latencyTooltip');
-
-    if (!latencyData.length && !timelineData.length) {
-        canvas.width = wrap.clientWidth || 800;
-        canvas.height = 60;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
-        ctx.textAlign = 'center';
-        ctx.font = '13px monospace';
-        ctx.fillText('当前时间段无 Latency 数据', canvas.width / 2, 35);
-        return;
-    }
-
-    const padLeft = 80;
-    const padRight = 10;
-    const padTop = 24;
-    const padBottom = 8;
-    const laneHeight = 28;
-    const MAX_CANVAS_WIDTH = 30000;
-
-    const bounds = computeUnifiedBounds();
-    if (!bounds) {
-        canvas.width = wrap.clientWidth || 800;
-        canvas.height = 60;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
-        ctx.textAlign = 'center';
-        ctx.font = '13px monospace';
-        ctx.fillText('当前时间段无 Latency 数据', canvas.width / 2, 35);
-        return;
-    }
-    const { minT, maxT, range } = bounds;
-
-    const timelineWrapEl = document.getElementById('timelineWrap');
-    const latencyWrapEl = document.getElementById('latencyWrap');
-    const containerW = Math.max(timelineWrapEl?.clientWidth || 0, latencyWrapEl?.clientWidth || 0, 1200);
-
-    const maxScale = (MAX_CANVAS_WIDTH - padLeft - padRight) / containerW;
-    if (tlScale > maxScale) {
-        tlScale = maxScale;
-        updateTlZoomUI();
-        updateLatZoomUI();
-    }
-
-    const drawWidth = Math.max(containerW * tlScale, containerW);
-    const W = Math.floor(padLeft + drawWidth + padRight);
-
-    const groupByName = document.getElementById('latGroupByName')?.checked ?? true;
-    let lanes = [];
-    
-    if (groupByName) {
-        const byName = {};
-        for (const r of latencyData) {
-            const name = r.name || 'unknown';
-            if (!byName[name]) byName[name] = [];
-            byName[name].push(r);
-        }
-        for (const [name, records] of Object.entries(byName)) {
-            records.sort((a, b) => a.mark_us - b.mark_us);
-            const nameLanes = [];
-            for (const r of records) {
-                let placed = false;
-                for (const lane of nameLanes) {
-                    const last = lane.blocks[lane.blocks.length - 1];
-                    if (r.mark_us >= last.measure_us) {
-                        lane.blocks.push(r);
-                        placed = true;
-                        break;
-                    }
-                }
-                if (!placed) nameLanes.push({ name, blocks: [r] });
-            }
-            lanes.push(...nameLanes);
-        }
-    } else {
-        lanes = latencyData.map(r => ({ name: r.name, blocks: [r] }));
-    }
-
-    const H = padTop + lanes.length * laneHeight + padBottom;
-    canvas.width = W;
-    canvas.height = H;
-    ctx.clearRect(0, 0, W, H);
-
-    const timeToX = (us) => padLeft + ((us - minT) / range) * drawWidth;
-
-    ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue('--border-light');
-    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-muted');
-    ctx.font = '10px monospace';
-    ctx.textAlign = 'center';
-    for (let i = 0; i <= 10; i++) {
-        const t = minT + (range * i / 10);
-        const x = timeToX(t);
-        ctx.beginPath();
-        ctx.moveTo(x, padTop - 4);
-        ctx.lineTo(x, padTop);
-        ctx.stroke();
-        ctx.fillText(formatLocal(t), x, padTop - 6);
-    }
-
-    latencyLayout = [];
-
-    for (let li = 0; li < lanes.length; li++) {
-        const lane = lanes[li];
-        const y = padTop + li * laneHeight;
-
-        if (li % 2 === 1) {
-            ctx.fillStyle = 'rgba(128,128,128,0.04)';
-            ctx.fillRect(0, y, W, laneHeight);
-        }
-
-        ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text-dim');
-        ctx.font = '11px monospace';
-        ctx.textAlign = 'right';
-        const label = lane.name.length > 10 ? lane.name.slice(0, 8) + '..' : lane.name;
-        ctx.fillText(label, padLeft - 6, y + laneHeight / 2 + 4);
-
-        for (const r of lane.blocks) {
-            const xMark = timeToX(r.mark_us);
-            const xClaim = timeToX(r.bind_us);
-            const xMeasure = timeToX(r.measure_us);
-            const w = Math.max(xMeasure - xMark, 2);
-            const baseY = y + laneHeight / 2;
-
-            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(xMark, baseY);
-            ctx.lineTo(xMeasure, baseY);
-            ctx.stroke();
-
-            ctx.fillStyle = '#10b981';
-            ctx.beginPath();
-            ctx.arc(xMark, baseY, 4, 0, Math.PI * 2);
-            ctx.fill();
-
-            if (r.bind_us && r.bind_us > r.mark_us) {
-                ctx.fillStyle = '#f59e0b';
-                ctx.beginPath();
-                ctx.arc(xClaim, baseY, 3, 0, Math.PI * 2);
-                ctx.fill();
-            }
-
-            ctx.fillStyle = '#ef4444';
-            ctx.beginPath();
-            ctx.arc(xMeasure, baseY, 4, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.strokeStyle = 'rgba(239,68,68,0.3)';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(xMark, baseY);
-            ctx.lineTo(xMeasure, baseY);
-            ctx.stroke();
-
-            if (w > 50) {
-                ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text');
-                ctx.font = '10px monospace';
-                ctx.textAlign = 'center';
-                ctx.fillText(`${r.duration_ms}ms`, xMark + w / 2, baseY - 8);
-            }
-
-            latencyLayout.push({
-                x: xMark,
-                y: y + 2,
-                w: Math.max(xMeasure - xMark, 8),
-                h: laneHeight - 4,
-                record: r
-            });
-        }
-    }
-
-    canvas.onmousemove = (e) => {
-        const mx = e.offsetX;
-        const my = e.offsetY;
-        const hit = latencyLayout.find(b => mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h);
-
-        if (hit) {
-            tooltip.style.display = 'block';
-            tooltip.style.left = (e.clientX + 12) + 'px';
-            tooltip.style.top = (e.clientY - 10) + 'px';
-            const r = hit.record;
-            const tagsMark = r.tags_mark?.length ? ` [${r.tags_mark.join(',')}]` : '';
-            const tagsClaim = r.tags_claim?.length ? ` [${r.tags_claim.join(',')}]` : '';
-            const tagsMeasure = r.tags_measure?.length ? ` [${r.tags_measure.join(',')}]` : '';
-            
-            tooltip.innerHTML =
-                `<div style="font-weight:bold;font-size:12px;color:#fff;margin-bottom:4px;">${r.name}</div>` +
-                `<div style="color:#ef4444;">总延迟: ${r.duration_ms}ms · 认领延迟: ${r.claim_delay_ms}ms</div>` +
-                `<div style="color:var(--text-muted);font-size:10px;margin-top:4px;line-height:1.6;">` +
-                `<span style="color:#10b981;">●</span> mark: ${formatLocal(r.mark_us)}${tagsMark}<br>` +
-                `<span style="color:#f59e0b;">●</span> claim: ${formatLocal(r.bind_us)}${tagsClaim}<br>` +
-                `<span style="color:#ef4444;">●</span> measure: ${formatLocal(r.measure_us)}${tagsMeasure}<br>` +
-                `uid: ${r.uid || '-'} · room: ${r.room || '-'} · trace: ${r.trace_id || '-'}<<br>` +
-                `mark_loc: ${r.mark_loc || '-'}<<br>` +
-                `claim_loc: ${r.claim_loc || '-'}<<br>` +
-                `measure_loc: ${r.measure_loc || '-'}<<br>` +
-                `</div>`;
-            canvas.style.cursor = 'pointer';
-        } else {
-            tooltip.style.display = 'none';
-            canvas.style.cursor = 'default';
-        }
-    };
-    canvas.onmouseleave = () => { tooltip.style.display = 'none'; };
-
-    updateLatZoomUI();
 }
 
 /* ========== 全局刷新 ========== */
