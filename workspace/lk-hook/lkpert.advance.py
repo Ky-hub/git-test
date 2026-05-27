@@ -239,6 +239,7 @@ class LKPMarkHandle:
     bind_us: int = 0
     bind_tags: List[str] = field(default_factory=list)
     bind_meta: Dict[str, Any] = field(default_factory=dict)
+    bind_id: Optional[str] = None    # <--- 新增：跨 task 匹配标识（如 room.name）
     # ---- 新增：调用位置追踪 ----
     mark_loc: str = ""      # lkp_mark 被调用的地方
     claim_loc: str = ""     # lkp_claim 被调用的地方
@@ -520,7 +521,7 @@ class __LKPerfRegistry:
         _lkp_logger.info(f"Dumped {len(snapshot)} spans to {path}")
 
     # ========== 延迟测量：mark / claim / measure ==========
-    def _mark(self, name: str, tags: Optional[List[str]], meta: Dict[str, Any]) -> Optional[LKPMarkHandle]:
+    def _mark(self, name: str, tags: Optional[List[str]], bind_id: Optional[str], meta: Dict[str, Any]) -> Optional[LKPMarkHandle]:
         if not self._enabled:
             _lkp_logger.debug(f"[Latency][mark] SKIP (disabled): name={name}")
             return None
@@ -543,7 +544,8 @@ class __LKPerfRegistry:
             room=room,
             trace_id=trace_id,
             parent_id=parent_id,
-            mark_loc=_lkp_get_caller_location(),   # <--- 新增：记录调用位置
+            bind_id=bind_id,                         # <--- 新增：跨 task 匹配标识
+            mark_loc=_lkp_get_caller_location(),
         )
 
         with self._mark_lock:
@@ -552,13 +554,12 @@ class __LKPerfRegistry:
 
         _lkp_logger.info(
             f"[Latency][mark] CREATE id={handle_id} name={name} "
-            f"uid={uid} room={room} trace={trace_id} parent={parent_id} "
-            f"loc={handle.mark_loc} pending_pool={pending_count}"   # <--- 新增 loc
+            f"uid={uid} room={room} trace={trace_id} parent={parent_id} bind_id={bind_id} "
+            f"loc={handle.mark_loc} pending_pool={pending_count}"
         )
-        _lkp_logger.debug(f"[Latency][mark] DETAIL id={handle_id} tags={tags} meta={meta}")
+        _lkp_logger.debug(f"[Latency][mark] DETAIL id={handle_id} tags={tags} meta={meta} bind_id={bind_id}")
         return handle
-
-    def _claim(self, handle=None, name=None, tags: Optional[List[str]] = None, meta: Dict[str, Any] = None) -> None:
+    def _claim(self, handle=None, name=None, bind_id=None, tags: Optional[List[str]] = None, meta: Dict[str, Any] = None) -> None:
         if not self._enabled:
             _lkp_logger.debug(f"[Latency][claim] SKIP (disabled)")
             return
@@ -573,12 +574,28 @@ class __LKPerfRegistry:
                 h = self._pending_marks.pop(handle_id, None)
                 mode = f"handle={handle_id}"
             elif name is not None:
-                # name 自动匹配：当前 uid 下该 name 的最新 pending
                 uid = _lkp_uid_ctx.get()
+                mode = f"name={name} uid={uid}"
+
+                # 1. 优先精确匹配 (name + uid)
                 candidates = [(hid, h) for hid, h in self._pending_marks.items()
                               if h.name == name and h.uid == uid and h.status == "pending"]
-                mode = f"name={name} uid={uid}"
-                _lkp_logger.debug(f"[Latency][claim] MATCH name={name} uid={uid} candidates={len(candidates)} pending_total={len(self._pending_marks)}")
+
+                # 2. 如果 uid 为空或没匹配到，且提供了 bind_id，按 bind_id 匹配
+                if not candidates and bind_id:
+                    candidates = [(hid, h) for hid, h in self._pending_marks.items()
+                                  if h.name == name and h.bind_id == bind_id and h.status == "pending"]
+                    if candidates:
+                        mode += f" bind_id={bind_id}"
+
+                # 3. 极端 fallback：uid 为空且没 bind_id，降级为 name-only（多 room 下会打 warn）
+                if not candidates and not uid and not bind_id:
+                    candidates = [(hid, h) for hid, h in self._pending_marks.items()
+                                  if h.name == name and h.status == "pending"]
+                    if candidates:
+                        _lkp_logger.warn(f"[Latency][claim] FALLBACK name-only for {name}，多 room 场景建议加 bind_id")
+
+                _lkp_logger.debug(f"[Latency][claim] MATCH {mode} candidates={len(candidates)} pending_total={len(self._pending_marks)}")
                 if not candidates:
                     _lkp_logger.warn(f"[Latency][claim] FAIL {mode}: 无 pending mark (pending_pool={len(self._pending_marks)})")
                     return
@@ -600,19 +617,18 @@ class __LKPerfRegistry:
             h.bind_us = int(time.time() * 1_000_000)
             h.bind_tags = tags or []
             h.bind_meta = meta or {}
-            h.claim_loc = _lkp_get_caller_location()   # <--- 新增：记录调用位置
+            h.claim_loc = _lkp_get_caller_location()
             self._bound_marks[h.id] = h
             bound_count = len(self._bound_marks)
 
         _lkp_logger.info(
             f"[Latency][claim] BOUND id={h.id} name={h.name} "
-            f"uid={h.uid} room={h.room} trace={h.trace_id} "
-            f"mark_loc={h.mark_loc} claim_loc={h.claim_loc} "   # <--- 新增位置信息
+            f"uid={h.uid} room={h.room} trace={h.trace_id} bind_id={h.bind_id} "
+            f"mark_loc={h.mark_loc} claim_loc={h.claim_loc} "
             f"{mode} bound_pool={bound_count}"
         )
         _lkp_logger.debug(f"[Latency][claim] DETAIL id={h.id} mark_us={h.mark_us} bind_us={h.bind_us} tags={tags} meta={meta}")
-
-    def _measure(self, handle=None, name=None, tags: Optional[List[str]] = None, meta: Dict[str, Any] = None) -> None:
+    def _measure(self, handle=None, name=None, bind_id=None, tags: Optional[List[str]] = None, meta: Dict[str, Any] = None) -> None:
         if not self._enabled:
             _lkp_logger.debug(f"[Latency][measure] SKIP (disabled)")
             return
@@ -629,12 +645,28 @@ class __LKPerfRegistry:
                 h = self._bound_marks.pop(handle_id, None)
                 mode = f"handle={handle_id}"
             elif name is not None:
-                # name 自动匹配：当前 uid 下该 name 的最新 bound
                 uid = _lkp_uid_ctx.get()
+                mode = f"name={name} uid={uid}"
+
+                # 1. 优先精确匹配 (name + uid)
                 candidates = [(hid, h) for hid, h in self._bound_marks.items()
                               if h.name == name and h.uid == uid and h.status == "bound"]
-                mode = f"name={name} uid={uid}"
-                _lkp_logger.debug(f"[Latency][measure] MATCH name={name} uid={uid} candidates={len(candidates)} bound_total={len(self._bound_marks)}")
+
+                # 2. 如果 uid 为空或没匹配到，且提供了 bind_id，按 bind_id 匹配
+                if not candidates and bind_id:
+                    candidates = [(hid, h) for hid, h in self._bound_marks.items()
+                                  if h.name == name and h.bind_id == bind_id and h.status == "bound"]
+                    if candidates:
+                        mode += f" bind_id={bind_id}"
+
+                # 3. 极端 fallback：uid 为空且没 bind_id，降级为 name-only（多 room 下会打 warn）
+                if not candidates and not uid and not bind_id:
+                    candidates = [(hid, h) for hid, h in self._bound_marks.items()
+                                  if h.name == name and h.status == "bound"]
+                    if candidates:
+                        _lkp_logger.warn(f"[Latency][measure] FALLBACK name-only for {name}，多 room 场景建议加 bind_id")
+
+                _lkp_logger.debug(f"[Latency][measure] MATCH {mode} candidates={len(candidates)} bound_total={len(self._bound_marks)}")
                 if not candidates:
                     _lkp_logger.error(f"[Latency][measure] FAIL {mode}: 无 bound mark (bound_pool={len(self._bound_marks)})")
                     return
@@ -653,7 +685,7 @@ class __LKPerfRegistry:
                 return
 
             h.status = "measured"
-            h.measure_loc = _lkp_get_caller_location()   # <--- 新增：记录调用位置
+            h.measure_loc = _lkp_get_caller_location()
             duration_ms = (measure_us - h.mark_us) / 1000.0
             claim_delay_ms = (h.bind_us - h.mark_us) / 1000.0 if h.bind_us else 0.0
 
@@ -669,13 +701,13 @@ class __LKPerfRegistry:
                 "room": h.room,
                 "trace_id": h.trace_id,
                 "parent_id": h.parent_id,
+                "bind_id": h.bind_id,
                 "tags_mark": h.tags,
                 "tags_claim": h.bind_tags,
                 "tags_measure": tags or [],
                 "meta_mark": h.meta,
                 "meta_claim": h.bind_meta,
                 "meta_measure": meta or {},
-                # ---- 新增：调用位置写入日志 ----
                 "mark_loc": h.mark_loc,
                 "claim_loc": h.claim_loc,
                 "measure_loc": h.measure_loc,
@@ -688,15 +720,14 @@ class __LKPerfRegistry:
 
         _lkp_logger.info(
             f"[Latency][measure] CLOSED id={h.id} name={h.name} "
-            f"uid={h.uid} room={h.room} trace={h.trace_id} "
+            f"uid={h.uid} room={h.room} trace={h.trace_id} bind_id={h.bind_id} "
             f"duration={duration_ms:.2f}ms claim_delay={claim_delay_ms:.2f}ms "
-            f"mark@{h.mark_loc} claim@{h.claim_loc} measure@{h.measure_loc} "   # <--- 新增位置信息
+            f"mark@{h.mark_loc} claim@{h.claim_loc} measure@{h.measure_loc} "
             f"{mode}"
         )
         _lkp_logger.debug(f"[Latency][measure] DETAIL id={h.id} mark_us={h.mark_us} bind_us={h.bind_us} measure_us={measure_us} tags_measure={tags} meta={meta}")
         if self._log_dir:
             _lkp_logger.debug(f"[Latency][measure] BUFFER buf_len={buf_len}")
-
     def _expire_marks(self) -> None:
         """清理超期的 pending / bound marks"""
         now_us = int(time.time() * 1_000_000)
@@ -1044,25 +1075,26 @@ def lkp_reload(config_path: Optional[str] = None) -> None:
 
 
 # ---------- 延迟测量 API ----------
-def lkp_mark(name: str, *, tags: Optional[List[str]] = None, **meta) -> Optional[LKPMarkHandle]:
-    """打起点，返回句柄。状态为 pending，不可被 measure，必须先 claim。"""
-    return _lkp_reg._mark(name, tags, meta)
+def lkp_mark(name: str, *, tags: Optional[List[str]] = None, bind_id: Optional[str] = None, **meta) -> Optional[LKPMarkHandle]:
+    """打起点，返回句柄。状态为 pending，不可被 measure，必须先 claim。
+    bind_id: 跨 task 匹配标识（如 room.name），不依赖 ContextVar 的 uid"""
+    return _lkp_reg._mark(name, tags, bind_id, meta)
 
 
-def lkp_claim(handle=None, *, name=None, tags: Optional[List[str]] = None, **meta) -> None:
+def lkp_claim(handle=None, *, name=None, bind_id=None, tags: Optional[List[str]] = None, **meta) -> None:
     """认领/激活一个 mark，使其变为 bound 状态，允许被 measure。
-    用法1（自动匹配）: lkp.lkp_claim(name="stt_to_llm")
+    用法1（自动匹配）: lkp.lkp_claim(name="stt_to_llm", bind_id=room.name)
     用法2（显式句柄）: lkp.lkp_claim(h)
     """
-    _lkp_reg._claim(handle=handle, name=name, tags=tags, meta=meta)
+    _lkp_reg._claim(handle=handle, name=name, bind_id=bind_id, tags=tags, meta=meta)
 
 
-def lkp_measure(handle=None, *, name=None, tags: Optional[List[str]] = None, **meta) -> None:
+def lkp_measure(handle=None, *, name=None, bind_id=None, tags: Optional[List[str]] = None, **meta) -> None:
     """闭合句柄，计算 mark → measure 的延迟，写入独立 latency 日志。
-    用法1（自动匹配）: lkp.lkp_measure(name="stt_to_llm")
+    用法1（自动匹配）: lkp.lkp_measure(name="stt_to_llm", bind_id=room.name)
     用法2（显式句柄）: lkp.lkp_measure(h)
     """
-    _lkp_reg._measure(handle=handle, name=name, tags=tags, meta=meta)
+    _lkp_reg._measure(handle=handle, name=name, bind_id=bind_id, tags=tags, meta=meta)
 
 
 # ========== 9. 线程池辅助函数 ==========
