@@ -6,6 +6,12 @@
   · 有子目录时：每个子目录是一个剧本（图片+音频）
   · 无子目录时：目录下每个音频文件是一个独立输入（纯音频）
 - ref_voice_path: 单个参考音色文件
+
+v3.2 更新：
+- 增加失败任务重试队列机制
+- 支持配置最大重试次数
+- 重试成功的任务会覆盖原失败记录
+- Manifest 完整记录重试轨迹
 """
 
 import os
@@ -153,20 +159,20 @@ def scan_audio_files(dir_path: str, recursive: bool = False) -> List[str]:
 def scan_scripts(script_dir: str) -> List[Dict[str, Any]]:
     """
     扫描剧本目录，自动识别两种结构：
-    
+
     1. 子目录模式（多模态）：
        script_dir/
          ├── script_01/
          │     ├── pic1.jpg + audio.wav
          ├── script_02/
          │     ├── pic1.jpg + audio.wav
-    
+
     2. 扁平模式（纯音频）：
        script_dir/
          ├── question1.wav
          ├── question2.mp3
          └── question3.wav
-    
+
     返回统一格式：每个元素包含 name, path, images[], audio, image_count, mode
     """
     if not os.path.isdir(script_dir):
@@ -270,7 +276,8 @@ def load_batch_configs(config_path: str) -> Dict[str, BatchConfigTemplate]:
 class BatchJob:
     def __init__(self, job_id: str, script_dir: str, output_dir: str,
                  system_prompt: str, voice_config: Dict[str, Any],
-                 ref_voice_path: str, manifest_path: Optional[str] = None):
+                 ref_voice_path: str, manifest_path: Optional[str] = None,
+                 max_retries: int = 2):
         self.id = job_id
         self.script_dir = script_dir
         self.output_dir = output_dir
@@ -279,10 +286,13 @@ class BatchJob:
         self.ref_voice_path = ref_voice_path
         self.manifest_path = manifest_path
         self.status = "pending"
-        self.tasks: List[Dict[str, Any]] = []
-        self.results: List[Dict[str, Any]] = []
+        self.tasks: List[Dict[str, Any]] = []          # 原始任务列表
+        self.retry_queue: List[Dict[str, Any]] = []   # 失败待重试队列
+        self.results: List[Dict[str, Any]] = []       # 最终结果（按原始 index 顺序）
+        self.retry_history: List[Dict[str, Any]] = []  # 重试轨迹记录
         self.progress = 0
         self.total = 0
+        self.max_retries = max_retries  # 最大重试次数（默认2次）
         self.created_at = datetime.now()
         self.completed_at: Optional[datetime] = None
 
@@ -317,8 +327,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="MiniCPM-o Batch Multimodal Gateway",
-    description="多模态/纯音频剧本批量测试",
-    version="3.1.0-batch-multimodal",
+    description="多模态/纯音频剧本批量测试（支持失败重试队列）",
+    version="3.2.0-batch-multimodal-retry",
     lifespan=lifespan,
     docs_url=None,
     redoc_url=None,
@@ -415,6 +425,156 @@ async def preview_voice(path: str):
 
 
 # ============================================================
+# 单任务处理函数（供首轮和重试复用）
+# ============================================================
+
+async def _process_single_task(
+    job: BatchJob,
+    task: Dict[str, Any],
+    worker: WorkerConnection,
+    out_dir: str,
+    ref_audio_b64: str,
+    is_retry: bool = False,
+    retry_round: int = 0,
+) -> Dict[str, Any]:
+    """
+    处理单个剧本任务。
+    返回: {"status": "success"|"no_audio"|"error", "entry": manifest_entry, "result": job_result, "should_retry": bool}
+    """
+    script_name = task["script_name"]
+    idx = task.get("original_index", task.get("index", 0))
+
+    try:
+        # 构造多模态 content
+        content = []
+        if task.get("images"):
+            for img_path in task["images"]:
+                img_b64 = await asyncio.to_thread(load_image_base64, img_path)
+                content.append({"type": "image", "data": img_b64})
+
+        audio_b64 = await asyncio.to_thread(load_audio_base64, task["audio"])
+        content.append({"type": "audio", "data": audio_b64})
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": job.system_prompt},
+                {"role": "user", "content": content},
+            ],
+            "generation": {
+                "max_new_tokens": job.voice_config.get("max_new_tokens", 256),
+                "do_sample": job.voice_config.get("do_sample", True),
+                "temperature": job.voice_config.get("temperature", 0.7),
+                "top_p": job.voice_config.get("top_p", 0.9),
+            },
+            "tts": {
+                "enabled": True,
+                "ref_audio_data": ref_audio_b64,
+            },
+        }
+
+        async with httpx.AsyncClient(timeout=worker_pool.request_timeout) as client:
+            resp = await client.post(f"{worker.url}/chat", json=payload)
+            resp.raise_for_status()
+            result = resp.json()
+
+        out_text = result.get("text", "")
+        out_audio_b64 = result.get("audio_data")
+        success = result.get("success", False)
+
+        safe_name = re.sub(r'[^a-zA-Z0-9_.\-]', '_', script_name)
+        retry_tag = f"_retry{retry_round}" if is_retry and retry_round > 0 else ""
+        out_name = f"{safe_name}{retry_tag}_out.wav"
+        out_path = os.path.join(out_dir, out_name)
+
+        if success and out_audio_b64:
+            await asyncio.to_thread(save_audio_base64, out_audio_b64, out_path)
+
+            entry = {
+                "index": idx,
+                "script_name": script_name,
+                "script_path": task.get("script_path", task.get("path")),
+                "mode": task.get("mode", "audio_only"),
+                "images": [os.path.basename(i) for i in task.get("images", [])],
+                "audio": os.path.basename(task["audio"]) if task.get("audio") else None,
+                "output_audio": out_name,
+                "output_path": out_path,
+                "text": out_text,
+                "status": "success",
+                "retry_round": retry_round,
+                "is_retry": is_retry,
+            }
+            result_item = {
+                "script": script_name,
+                "images": len(task.get("images", [])),
+                "audio": os.path.basename(task["audio"]) if task.get("audio") else None,
+                "mode": task.get("mode", "audio_only"),
+                "output": out_name,
+                "text": out_text,
+                "status": "success",
+                "retry_round": retry_round,
+            }
+            return {"status": "success", "entry": entry, "result": result_item, "should_retry": False}
+
+        else:
+            # Worker 返回了但无音频 / 标记失败 → 可重试
+            entry = {
+                "index": idx,
+                "script_name": script_name,
+                "script_path": task.get("script_path", task.get("path")),
+                "mode": task.get("mode", "audio_only"),
+                "images": [os.path.basename(i) for i in task.get("images", [])],
+                "audio": os.path.basename(task["audio"]) if task.get("audio") else None,
+                "output_audio": None,
+                "output_path": None,
+                "text": out_text or "Worker 未返回音频",
+                "status": "no_audio",
+                "retry_round": retry_round,
+                "is_retry": is_retry,
+            }
+            result_item = {
+                "script": script_name,
+                "images": len(task.get("images", [])),
+                "audio": os.path.basename(task["audio"]) if task.get("audio") else None,
+                "mode": task.get("mode", "audio_only"),
+                "output": None,
+                "text": out_text or "Worker 未返回音频",
+                "status": "no_audio",
+                "retry_round": retry_round,
+            }
+            return {"status": "no_audio", "entry": entry, "result": result_item, "should_retry": True}
+
+    except Exception as e:
+        logger.error(f"[Batch {job.id}] {'[Retry] ' if is_retry else ''}失败 {script_name}: {e}", exc_info=True)
+        entry = {
+            "index": idx,
+            "script_name": script_name,
+            "script_path": task.get("script_path", task.get("path")),
+            "mode": task.get("mode", "audio_only"),
+            "images": [os.path.basename(i) for i in task.get("images", [])],
+            "audio": os.path.basename(task["audio"]) if task.get("audio") else None,
+            "output_audio": None,
+            "output_path": None,
+            "text": str(e),
+            "status": "error",
+            "retry_round": retry_round,
+            "is_retry": is_retry,
+            "error_type": type(e).__name__,
+        }
+        result_item = {
+            "script": script_name,
+            "images": len(task.get("images", [])),
+            "audio": os.path.basename(task["audio"]) if task.get("audio") else None,
+            "mode": task.get("mode", "audio_only"),
+            "output": None,
+            "text": str(e),
+            "status": "error",
+            "retry_round": retry_round,
+            "error_type": type(e).__name__,
+        }
+        return {"status": "error", "entry": entry, "result": result_item, "should_retry": True}
+
+
+# ============================================================
 # 批量任务 API
 # ============================================================
 
@@ -427,6 +587,7 @@ async def create_batch_job(
     selected_scripts: Optional[str] = Form(None),
     output_dir: Optional[str] = Form(None),
     voice_config_json: Optional[str] = Form("{}"),
+    max_retries: int = Form(default=2),
 ):
     if worker_pool is None:
         raise HTTPException(status_code=503, detail="Service not ready")
@@ -474,6 +635,7 @@ async def create_batch_job(
         voice_config=voice_config,
         ref_voice_path=ref_voice_path,
         manifest_path=manifest_path,
+        max_retries=max_retries,
     )
 
     for s in valid_scripts:
@@ -495,6 +657,7 @@ async def create_batch_job(
         "total_tasks": job.total,
         "scripts": len(valid_scripts),
         "ref_voice": os.path.basename(ref_voice_path),
+        "max_retries": max_retries,
         "system_prompt_preview": system_prompt[:60] + "..." if len(system_prompt) > 60 else system_prompt,
     }
 
@@ -504,6 +667,7 @@ async def run_batch_job(job: BatchJob):
     out_dir = os.path.join(job.output_dir, "outputs")
     os.makedirs(out_dir, exist_ok=True)
 
+    # 预加载参考音色
     try:
         ref_audio_b64 = await asyncio.to_thread(load_audio_base64, job.ref_voice_path)
         logger.info(f"参考音色已加载: {job.ref_voice_path}")
@@ -512,138 +676,128 @@ async def run_batch_job(job: BatchJob):
         job.status = "failed"
         return
 
-    manifest_entries: List[Dict[str, Any]] = []
+    manifest_entries: List[Optional[Dict[str, Any]]] = [None] * job.total  # 按原始索引占位
+    round_num = 0
+
+    # ============================================================
+    # 第 0 轮：首轮执行（原始任务）
+    # ============================================================
+    logger.info(f"[Batch {job.id}] ===== 第 0 轮（首轮）开始，共 {job.total} 个任务 =====")
 
     for idx, task in enumerate(job.tasks):
         worker = await worker_pool.acquire(job.id)
         worker.total_requests += 1
 
         try:
-            # 构造多模态 content：有图片就加图片，再叠加音频
-            content = []
-            if task["images"]:
-                for img_path in task["images"]:
-                    img_b64 = await asyncio.to_thread(load_image_base64, img_path)
-                    content.append({"type": "image", "data": img_b64})
+            # 注入原始索引，方便后续重试对应
+            task["original_index"] = idx
 
-            audio_b64 = await asyncio.to_thread(load_audio_base64, task["audio"])
-            content.append({"type": "audio", "data": audio_b64})
+            proc = await _process_single_task(
+                job=job, task=task, worker=worker, out_dir=out_dir,
+                ref_audio_b64=ref_audio_b64, is_retry=False, retry_round=0
+            )
 
-            payload = {
-                "messages": [
-                    {"role": "system", "content": job.system_prompt},
-                    {"role": "user", "content": content},
-                ],
-                "generation": {
-                    "max_new_tokens": job.voice_config.get("max_new_tokens", 256),
-                    "do_sample": job.voice_config.get("do_sample", True),
-                    "temperature": job.voice_config.get("temperature", 0.7),
-                    "top_p": job.voice_config.get("top_p", 0.9),
-                },
-                "tts": {
-                    "enabled": True,
-                    "ref_audio_data": ref_audio_b64,
-                },
-            }
+            manifest_entries[idx] = proc["entry"]
+            job.results.append(proc["result"])
 
-            async with httpx.AsyncClient(timeout=worker_pool.request_timeout) as client:
-                resp = await client.post(f"{worker.url}/chat", json=payload)
-                resp.raise_for_status()
-                result = resp.json()
+            if proc["should_retry"]:
+                # 加入重试队列，记录已尝试次数
+                retry_task = dict(task)
+                retry_task["retry_attempted"] = 1
+                job.retry_queue.append(retry_task)
+                logger.warning(f"[Batch {job.id}] 任务 {task['script_name']} 进入重试队列（原因: {proc['status']}）")
 
-            out_text = result.get("text", "")
-            out_audio_b64 = result.get("audio_data")
-            success = result.get("success", False)
-
-            safe_name = re.sub(r'[^a-zA-Z0-9_.\-]', '_', task["script_name"])
-            out_name = f"{safe_name}_out.wav"
-            out_path = os.path.join(out_dir, out_name)
-
-            if success and out_audio_b64:
-                await asyncio.to_thread(save_audio_base64, out_audio_b64, out_path)
-
-                entry = {
-                    "index": idx,
-                    "script_name": task["script_name"],
-                    "script_path": task["script_path"],
-                    "mode": task["mode"],
-                    "images": [os.path.basename(i) for i in task["images"]],
-                    "audio": os.path.basename(task["audio"]),
-                    "output_audio": out_name,
-                    "output_path": out_path,
-                    "text": out_text,
-                    "status": "success",
-                }
-                manifest_entries.append(entry)
-                job.results.append({
-                    "script": task["script_name"],
-                    "images": len(task["images"]),
-                    "audio": os.path.basename(task["audio"]),
-                    "mode": task["mode"],
-                    "output": out_name,
-                    "text": out_text,
-                    "status": "success",
-                })
-            else:
-                entry = {
-                    "index": idx,
-                    "script_name": task["script_name"],
-                    "script_path": task["script_path"],
-                    "mode": task["mode"],
-                    "images": [os.path.basename(i) for i in task["images"]],
-                    "audio": os.path.basename(task["audio"]),
-                    "output_audio": None,
-                    "output_path": None,
-                    "text": out_text or "Worker 未返回音频",
-                    "status": "no_audio" if success else "error",
-                }
-                manifest_entries.append(entry)
-                job.results.append({
-                    "script": task["script_name"],
-                    "images": len(task["images"]),
-                    "audio": os.path.basename(task["audio"]),
-                    "mode": task["mode"],
-                    "output": None,
-                    "text": out_text or "Worker 未返回音频",
-                    "status": "no_audio" if success else "error",
-                })
-
-        except Exception as e:
-            logger.error(f"[Batch {job.id}] 失败 {task['script_name']}: {e}", exc_info=True)
-            entry = {
-                "index": idx,
-                "script_name": task["script_name"],
-                "script_path": task["script_path"],
-                "mode": task["mode"],
-                "images": [os.path.basename(i) for i in task["images"]],
-                "audio": os.path.basename(task["audio"]) if task["audio"] else None,
-                "output_audio": None,
-                "output_path": None,
-                "text": str(e),
-                "status": "error",
-            }
-            manifest_entries.append(entry)
-            job.results.append({
-                "script": task["script_name"],
-                "images": len(task["images"]),
-                "audio": os.path.basename(task["audio"]) if task["audio"] else None,
-                "mode": task["mode"],
-                "output": None,
-                "text": str(e),
-                "status": "error",
-            })
         finally:
             worker_pool.release(worker)
             job.progress = idx + 1
-            if (idx + 1) % 5 == 0 or idx == len(job.tasks) - 1:
-                await asyncio.to_thread(_write_manifest, job, manifest_entries)
+
+    # 首轮完成后立即写一次 manifest
+    await asyncio.to_thread(_write_manifest, job, manifest_entries)
+
+    # ============================================================
+    # 第 1~N 轮：重试队列（直到队列为空或达到最大重试次数）
+    # ============================================================
+    while job.retry_queue and round_num < job.max_retries:
+        round_num += 1
+        current_round_tasks = job.retry_queue
+        job.retry_queue = []  # 清空，本轮失败的再重新加入
+
+        # 重试前等待一小段时间，让 Worker 有机会恢复
+        if round_num > 0:
+            await asyncio.sleep(2.0)
+
+        logger.info(f"[Batch {job.id}] ===== 第 {round_num} 轮（重试）开始，共 {len(current_round_tasks)} 个任务 =====")
+
+        for task in current_round_tasks:
+            worker = await worker_pool.acquire(job.id)
+            worker.total_requests += 1
+
+            try:
+                idx = task["original_index"]
+
+                proc = await _process_single_task(
+                    job=job, task=task, worker=worker, out_dir=out_dir,
+                    ref_audio_b64=ref_audio_b64, is_retry=True, retry_round=round_num
+                )
+
+                # 记录重试历史
+                job.retry_history.append({
+                    "script_name": task["script_name"],
+                    "round": round_num,
+                    "status": proc["status"],
+                    "text": proc["entry"]["text"],
+                })
+
+                if proc["status"] == "success":
+                    # 重试成功：覆盖 manifest_entries 中的失败记录
+                    manifest_entries[idx] = proc["entry"]
+                    # 更新 results 中对应记录（按 script_name 匹配替换）
+                    for i, r in enumerate(job.results):
+                        if r["script"] == task["script_name"] and r.get("retry_round", 0) < round_num:
+                            job.results[i] = proc["result"]
+                            break
+                    logger.info(f"[Batch {job.id}] 重试成功 {task['script_name']}（第 {round_num} 轮）")
+
+                else:
+                    # 仍然失败
+                    attempted = task.get("retry_attempted", 0) + 1
+                    if attempted <= job.max_retries:
+                        task["retry_attempted"] = attempted
+                        job.retry_queue.append(task)
+                        logger.warning(f"[Batch {job.id}] 任务 {task['script_name']} 第 {round_num} 轮仍失败，继续排队")
+                    else:
+                        # 达到上限，最终失败
+                        logger.error(f"[Batch {job.id}] 任务 {task['script_name']} 最终失败（已达最大重试 {job.max_retries} 次）")
+                        # 更新为最终失败记录
+                        manifest_entries[idx] = proc["entry"]
+                        for i, r in enumerate(job.results):
+                            if r["script"] == task["script_name"]:
+                                job.results[i] = proc["result"]
+                                break
+
+            finally:
+                worker_pool.release(worker)
+                job.progress += 1  # 重试也算进度
+
+        # 每轮重试后写 manifest
+        await asyncio.to_thread(_write_manifest, job, manifest_entries)
+
+    # ============================================================
+    # 收尾：如果还有未处理完的（理论上不应有，除非 max_retries=0）
+    # ============================================================
+    if job.retry_queue:
+        for task in job.retry_queue:
+            idx = task["original_index"]
+            logger.error(f"[Batch {job.id}] 任务 {task['script_name']} 放弃重试（超出最大次数）")
+            # 保持最后一轮的错误记录已在 manifest 中
 
     job.status = "completed"
     job.completed_at = datetime.now()
-    logger.info(f"[Batch {job.id}] 完成: {job.progress}/{job.total}")
+    job.progress = job.total  # 最终进度归位
+    logger.info(f"[Batch {job.id}] 完成: {job.total} 个任务，重试 {round_num} 轮，最终剩余失败 {len(job.retry_queue)} 个")
 
 
-def _write_manifest(job: BatchJob, entries: List[Dict[str, Any]]):
+def _write_manifest(job: BatchJob, entries: List[Optional[Dict[str, Any]]]):
     manifest = {
         "job_id": job.id,
         "script_dir": job.script_dir,
@@ -652,10 +806,13 @@ def _write_manifest(job: BatchJob, entries: List[Dict[str, Any]]):
         "system_prompt": job.system_prompt,
         "voice_config": job.voice_config,
         "total_tasks": job.total,
-        "completed_tasks": len(entries),
+        "completed_tasks": len([e for e in entries if e is not None]),
+        "max_retries": job.max_retries,
+        "retry_history": job.retry_history,
+        "final_failed_count": len(job.retry_queue),
         "created_at": job.created_at.isoformat(),
         "completed_at": datetime.now().isoformat() if job.status == "completed" else None,
-        "mapping": entries,
+        "mapping": [e for e in entries if e is not None],  # 过滤掉可能的 None
     }
     with open(job.manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -675,6 +832,9 @@ async def get_job(job_id: str):
         "ref_voice_path": job.ref_voice_path,
         "output_dir": job.output_dir,
         "manifest_path": job.manifest_path,
+        "max_retries": job.max_retries,
+        "retry_queue_remaining": len(job.retry_queue),
+        "retry_history": job.retry_history,
         "created_at": job.created_at.isoformat(),
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "results": job.results,
@@ -783,7 +943,7 @@ def main():
     global worker_pool
     worker_pool = SimpleWorkerPool(worker_list, request_timeout=args.timeout)
 
-    logger.info(f"Starting Batch Multimodal Gateway v3.1 on {args.host}:{args.port}")
+    logger.info(f"Starting Batch Multimodal Gateway v3.2 on {args.host}:{args.port}")
     logger.info(f"Workers: {worker_list}")
 
     uvicorn.run(app, host=args.host, port=args.port)
