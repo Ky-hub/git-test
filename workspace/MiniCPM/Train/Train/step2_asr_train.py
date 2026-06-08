@@ -423,7 +423,7 @@ class ASRDataCollator:
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
         # labels：padding 设为 -100
-        labels = input_ids.clone()
+        labels = input_ids.clone().long()   # ← 修改 2：显式 .long()
         pad_token_id = self.processor.tokenizer.pad_token_id or 0
         labels[labels == pad_token_id] = -100
 
@@ -597,7 +597,7 @@ def train():
                 labels = batch["labels"]
 
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                shift_labels = labels[..., 1:].contiguous().long()
 
                 loss = F.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
