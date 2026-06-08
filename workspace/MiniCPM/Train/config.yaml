@@ -1,0 +1,36 @@
+# ============================================
+# MiniCPM-o 微调 - 基础配置文件
+# ============================================
+
+# 模型路径 (HF Hub 或本地绝对路径)
+model_name_or_path: "openbmb/MiniCPM-o-4_5"
+trust_remote_code: true
+
+# 显卡设置（仅用于日志显示，实际通过命令行 CUDA_VISIBLE_DEVICES 控制）
+cuda_visible_devices: "0"
+
+# 计算精度与设备
+torch_dtype: "bfloat16"      # bfloat16 / float16 / float32
+device: "cuda"               # cuda / cpu
+
+# 模型运行模式
+# chat      - 单轮/多轮对话（非流式）
+# streaming - 流式对话
+# duplex    - 全双工对话
+mode: "chat"
+
+# --------------------------------------------
+# 模块冻结配置 (true=冻结, false=训练)
+# --------------------------------------------
+freeze_llm: false            # 是否冻结大语言模型主干
+freeze_vision: true          # 是否冻结视觉编码器 (SigLIP)
+freeze_audio: true           # 是否冻结音频编码器 (Whisper)
+freeze_tts: true             # 是否冻结语音合成模块
+
+# LLM 分层解冻配置（仅在 freeze_llm=true 时生效）
+# 例如: [-4, -3, -2, -1] 表示只训练最后 4 个 Transformer 层
+# 设为 null 表示全部冻结
+unfreeze_llm_layers: null
+
+# 输出路径
+output_dir: "./minicpmo_finetuned"
