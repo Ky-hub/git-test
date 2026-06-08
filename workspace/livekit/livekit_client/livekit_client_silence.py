@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 LiveKit Python 客户端 (配置驱动版 + 音频帧监听日志 + 静音检测)
-重点：通过静音检测区分"有效音频"和"静音填充帧"，
-只在真正收到声音时记录 first_frame / utterance，避免静音期日志爆炸。
+【重写】基于显式状态机的 utterance 检测，彻底分离"静音确认"和"分段触发"逻辑。
 
-【修复】utterance 检测基于"静音持续时间"而非"帧间间隔"，
-解决静音帧持续更新 prev_frame_time 导致无法检测新 utterance 的问题。
+状态机:
+    IDLE → SPEAKING → SILENCE_CANDIDATE → SILENCE_CONFIRMED ─┬─→ SPEAKING (同一段，静音太短)
+                                                              └─→ SPEAKING_NEW (新 utterance，静音够长)
+
+关键参数:
+    silence_confirmation_frames: 连续多少帧静音才"确认"进入静音期（过滤抖动/换气）
+    min_silence_ms:            确认静音后，需持续多久才允许触发新 utterance（真正分段阈值）
 
 依赖:
     pip install livekit livekit-api sounddevice numpy
@@ -19,8 +23,9 @@ LiveKit Python 客户端 (配置驱动版 + 音频帧监听日志 + 静音检测
         "agent_name": "python-agent",
         "log_dir": "./audio_logs",
         "log_flush_interval": 1.0,
-        "utterance_gap_ms": 150,
-        "silence_threshold": 100
+        "silence_threshold": 100,
+        "silence_confirmation_frames": 30,
+        "min_silence_ms": 800
     }
 """
 
@@ -33,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any, Set
 from datetime import datetime
+from enum import Enum, auto
 
 import numpy as np
 import sounddevice as sd
@@ -60,8 +66,12 @@ class Config:
         self.publish_mic = data.get("publish_mic", True)
         self.log_dir = data.get("log_dir", "./audio_logs")
         self.log_flush_interval = data.get("log_flush_interval", 1.0)
-        self.utterance_gap_ms = data.get("utterance_gap_ms", 150)
         self.silence_threshold = data.get("silence_threshold", 100)
+        # 连续静音多少帧才确认进入静音期（过滤单帧抖动）
+        self.silence_confirmation_frames = data.get("silence_confirmation_frames", 30)
+        # 【核心】确认静音后，需持续多久才触发新 utterance（毫秒）
+        # 设大值可避免短停顿被切分。例如 800ms 意味着停顿 < 800ms 视为同一段话
+        self.min_silence_ms = data.get("min_silence_ms", 800)
 
     @staticmethod
     def _require(data, key):
@@ -95,10 +105,6 @@ def generate_token(config: Config) -> str:
 # ========================== 静音检测工具 ==========================
 
 def is_silence_frame(frame: AudioFrame, threshold: int = 100) -> tuple[bool, int]:
-    """
-    检测音频帧是否为静音。
-    返回: (是否静音, 峰值绝对值)
-    """
     if not hasattr(frame.data, "__len__") or len(frame.data) == 0:
         return True, 0
     audio_data = np.asarray(frame.data, dtype=np.int16)
@@ -111,16 +117,6 @@ def is_silence_frame(frame: AudioFrame, threshold: int = 100) -> tuple[bool, int
 # ========================== 音频帧日志记录器 ==========================
 
 class AudioFrameLogger:
-    """
-    事件类型：
-        - session_start         : 音频流开始
-        - first_frame           : 首个非静音帧（track 级别）
-        - utterance_first_frame : 每次从静音恢复后的首个非静音帧
-        - frame                 : 非静音普通帧
-        - silence_period        : 连续静音期摘要
-        - session_end           : 音频流结束
-    """
-
     def __init__(self, log_dir: str, flush_interval: float = 1.0):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -201,7 +197,10 @@ class AudioFrameLogger:
                 self._buffers[track_sid] = []
 
     async def log_session_start(self, track_sid: str, participant: str,
-                                sample_rate: int, num_channels: int):
+                                sample_rate: int, num_channels: int,
+                                silence_threshold: int,
+                                silence_confirmation_frames: int,
+                                min_silence_ms: int):
         record = {
             "event": "session_start",
             "timestamp": time.time(),
@@ -210,7 +209,9 @@ class AudioFrameLogger:
             "participant_identity": participant,
             "sample_rate": sample_rate,
             "num_channels": num_channels,
-            "silence_threshold": self._silence_threshold if hasattr(self, '_silence_threshold') else 100,
+            "silence_threshold": silence_threshold,
+            "silence_confirmation_frames": silence_confirmation_frames,
+            "min_silence_ms": min_silence_ms,
         }
         await self._append(track_sid, participant, record)
 
@@ -244,7 +245,6 @@ class AudioFrameLogger:
 
     async def log_utterance_first_frame(self, track_sid: str, participant: str,
                                         frame: AudioFrame, silence_duration_ms: float, peak: int):
-        """【修复】基于静音持续时间检测新 utterance。"""
         self._utterance_counter[track_sid] = self._utterance_counter.get(track_sid, 0) + 1
         idx = self._utterance_counter[track_sid]
 
@@ -329,6 +329,14 @@ class AudioFrameLogger:
 
 # ========================== 客户端核心 ==========================
 
+class AudioState(Enum):
+    """音频接收状态机"""
+    IDLE = auto()              # 初始，未收到有效音频
+    SPEAKING = auto()          # 正在接收有效音频（非静音）
+    SILENCE_CANDIDATE = auto() # 出现静音帧，候选中（可能短暂停顿）
+    SILENCE_CONFIRMED = auto() # 已确认进入静音期（连续静音帧达标）
+
+
 class LiveKitClient:
     def __init__(self, config: Config):
         self.config = config
@@ -385,8 +393,12 @@ class LiveKitClient:
                 await self.publish_microphone()
             except Exception as e:
                 print(f"[!] 麦克风发布失败: {e}")
-        print(f"\n[*] 运行中，silence_threshold={self.config.silence_threshold}, utterance_gap={self.config.utterance_gap_ms}ms")
-        print("[*] 按 Ctrl+C 退出...")
+        cfg = self.config
+        print(f"\n[*] 运行中")
+        print(f"    silence_threshold={cfg.silence_threshold}")
+        print(f"    silence_confirmation_frames={cfg.silence_confirmation_frames}")
+        print(f"    min_silence_ms={cfg.min_silence_ms}")
+        print(f"[*] 按 Ctrl+C 退出...")
         try:
             while self._running:
                 await asyncio.sleep(0.5)
@@ -454,7 +466,7 @@ class LiveKitClient:
                 pass
             del self.audio_players[track.sid]
 
-    # ---------- 音频任务 ----------
+    # ---------- 音频任务（状态机版）----------
     async def _audio_playback_task(self, track_sid: str, audio_stream: AudioStream, identity: str):
         print(f"[*] 播放任务启动: {track_sid}")
         try:
@@ -472,95 +484,119 @@ class LiveKitClient:
         player.start()
         self.audio_players[track_sid] = player
 
-        await self.frame_logger.log_session_start(track_sid, identity, sr, ch)
+        cfg = self.config
+        await self.frame_logger.log_session_start(
+            track_sid, identity, sr, ch,
+            cfg.silence_threshold, cfg.silence_confirmation_frames, cfg.min_silence_ms
+        )
 
-        # ========== 【修复】状态机变量 ==========
-        is_first_frame = True           # track 级别是否还没收到过非静音帧
-        was_speaking = False            # 上一帧是否在说话（非静音）
-        silence_streak = 0            # 连续静音帧计数
-        silence_start_time = 0.0      # 本次静音期开始时间（绝对时间戳）
-        frame_count = 0               # 有效（非静音）帧计数
-        total_raw_frames = 0          # 原始帧计数（含静音）
+        # ========== 状态机变量 ==========
+        state = AudioState.IDLE
+        silence_candidate_count = 0
+        silence_start_time = 0.0      # 首次静音帧的时间戳
+        frame_count = 0               # 有效帧计数
+        total_raw_frames = 0          # 原始帧计数
         start_time = time.time()
-        # ========================================
+        # =================================
 
         async def _process_frame(frame: AudioFrame):
-            nonlocal is_first_frame, was_speaking, silence_streak, silence_start_time
+            nonlocal state, silence_candidate_count, silence_start_time
             nonlocal frame_count, total_raw_frames
 
             total_raw_frames += 1
             current_time = time.time()
+            is_silence, peak = is_silence_frame(frame, cfg.silence_threshold)
 
-            # ---- 静音检测 ----
-            is_silence, peak = is_silence_frame(frame, self.config.silence_threshold)
-
-            if is_silence:
-                # ===== 静音帧 =====
-                if was_speaking:
-                    # 刚进入静音期
-                    was_speaking = False
-                    silence_streak = 1
-                    silence_start_time = current_time
-                else:
-                    # 持续静音中
-                    silence_streak += 1
-
-                # 播放静音帧（保持播放器 buffer 不空）
-                self._play_frame(player, frame)
-
-                # 每 500 帧静音（约5秒@10ms/帧）记录一次摘要
-                if silence_streak == 1 or silence_streak % 500 == 0:
-                    silence_ms = (current_time - silence_start_time) * 1000.0 if silence_start_time > 0 else 0
-                    await self.frame_logger.log_silence_period(
-                        track_sid, identity, silence_streak, silence_ms)
-                return
-
-            # ===== 非静音帧（有效音频）=====
-            if not was_speaking:
-                # === 从静音期恢复 ===
-                silence_duration_ms = 0.0
-                if silence_start_time > 0:
-                    silence_duration_ms = (current_time - silence_start_time) * 1000.0
-
-                if is_first_frame:
-                    # Track 级别首次有效音频
+            # ===== 状态机转换 =====
+            if state == AudioState.IDLE:
+                if not is_silence:
+                    # 首个有效帧
                     await self.frame_logger.log_first_frame(track_sid, identity, frame, peak)
-                    is_first_frame = False
+                    frame_count += 1
+                    await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
+                    state = AudioState.SPEAKING
                     print(f"\n{'='*60}")
                     print(f"[FIRST FRAME] 首个有效音频帧!")
                     print(f"  Track SID : {track_sid}")
                     print(f"  From      : {identity}")
                     print(f"  时间戳(秒) : {current_time:.6f}")
                     print(f"  ISO 时间   : {datetime.fromtimestamp(current_time).isoformat()}")
-                    print(f"  峰值幅度   : {peak} (threshold={self.config.silence_threshold})")
+                    print(f"  峰值幅度   : {peak} (threshold={cfg.silence_threshold})")
                     print(f"{'='*60}\n")
-                elif silence_duration_ms > self.config.utterance_gap_ms:
-                    # 【修复】基于静音持续时间判断新 utterance
-                    await self.frame_logger.log_utterance_first_frame(
-                        track_sid, identity, frame, silence_duration_ms, peak)
-                    idx = self.frame_logger._utterance_counter.get(track_sid, 0)
-                    print(f"\n{'='*60}")
-                    print(f"[UTTERANCE #{idx}] 新段落开始!")
-                    print(f"  静音期持续: {silence_duration_ms:.1f}ms (threshold={self.config.utterance_gap_ms}ms)")
-                    print(f"  Track SID : {track_sid}")
-                    print(f"  From      : {identity}")
-                    print(f"  时间戳(秒) : {current_time:.6f}")
-                    print(f"  ISO 时间   : {datetime.fromtimestamp(current_time).isoformat()}")
-                    print(f"  峰值幅度   : {peak}")
-                    print(f"{'='*60}\n")
+                # 静音帧在IDLE状态：直接丢弃，不播放，不记录
                 else:
-                    # 静音太短，视为同一段话继续（不记录新 utterance）
                     pass
+                self._play_frame(player, frame)
 
-                was_speaking = True
-                silence_streak = 0
+            elif state == AudioState.SPEAKING:
+                if is_silence:
+                    # 进入静音候选
+                    state = AudioState.SILENCE_CANDIDATE
+                    silence_candidate_count = 1
+                    silence_start_time = current_time
+                else:
+                    # 继续说话
+                    frame_count += 1
+                    await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
+                self._play_frame(player, frame)
 
-            # 记录普通帧 + 播放
-            frame_count += 1
-            await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
-            self._play_frame(player, frame)
+            elif state == AudioState.SILENCE_CANDIDATE:
+                if is_silence:
+                    silence_candidate_count += 1
+                    if silence_candidate_count >= cfg.silence_confirmation_frames:
+                        # 确认进入静音期
+                        state = AudioState.SILENCE_CONFIRMED
+                        # 可选：打印确认信息
+                        # confirmed_ms = (current_time - silence_start_time) * 1000.0
+                        # print(f"[*] [{track_sid}] 静音确认: {silence_candidate_count}帧 ({confirmed_ms:.1f}ms)")
+                else:
+                    # 短静音，恢复说话（抖动/换气）
+                    state = AudioState.SPEAKING
+                    silence_candidate_count = 0
+                    frame_count += 1
+                    await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
+                    print(f"[*] [{track_sid}] 短静音恢复 ({silence_candidate_count}帧), 视为同一段话")
+                self._play_frame(player, frame)
 
-            if frame_count % 100 == 0:
+            elif state == AudioState.SILENCE_CONFIRMED:
+                if not is_silence:
+                    # 从确认静音期恢复
+                    silence_duration_ms = (current_time - silence_start_time) * 1000.0
+                    state = AudioState.SPEAKING
+                    silence_candidate_count = 0
+
+                    if silence_duration_ms >= cfg.min_silence_ms:
+                        # 【核心】静音足够长，触发新 utterance
+                        await self.frame_logger.log_utterance_first_frame(
+                            track_sid, identity, frame, silence_duration_ms, peak)
+                        idx = self.frame_logger._utterance_counter.get(track_sid, 0)
+                        frame_count += 1
+                        await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
+                        print(f"\n{'='*60}")
+                        print(f"[UTTERANCE #{idx}] 新段落开始!")
+                        print(f"  静音期持续: {silence_duration_ms:.1f}ms (阈值={cfg.min_silence_ms}ms)")
+                        print(f"  确认帧数  : {cfg.silence_confirmation_frames}")
+                        print(f"  Track SID : {track_sid}")
+                        print(f"  From      : {identity}")
+                        print(f"  时间戳(秒) : {current_time:.6f}")
+                        print(f"  ISO 时间   : {datetime.fromtimestamp(current_time).isoformat()}")
+                        print(f"  峰值幅度   : {peak}")
+                        print(f"{'='*60}\n")
+                    else:
+                        # 静音太短，视为同一段话继续
+                        frame_count += 1
+                        await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
+                        print(f"[*] [{track_sid}] 忽略短停顿 (静音{silence_duration_ms:.1f}ms < {cfg.min_silence_ms}ms)")
+                else:
+                    # 继续静音，记录摘要
+                    if silence_candidate_count % 500 == 0:
+                        silence_ms = (current_time - silence_start_time) * 1000.0
+                        await self.frame_logger.log_silence_period(
+                            track_sid, identity, silence_candidate_count, silence_ms)
+                self._play_frame(player, frame)
+
+            # 定期打印进度
+            if frame_count > 0 and frame_count % 100 == 0:
                 elapsed = time.time() - start_time
                 print(f"[{track_sid}] 有效音频 {frame_count} 帧, 运行 {elapsed:.1f}s (原始帧 {total_raw_frames})")
 
