@@ -527,6 +527,8 @@ def train():
         torch_dtype=dtype,
     ).to(device)
 
+  model.config.stream_input = False
+
     if hasattr(model, "set_mode"):
         mode_map = {
             "chat": ProcessorMode.CHAT,
