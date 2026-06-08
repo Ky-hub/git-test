@@ -586,65 +586,82 @@ def train():
     global_step = 0
     total_loss = 0
 
-    for epoch in range(cfg.num_epochs):
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.num_epochs}")
+  for epoch in range(cfg.num_epochs):
+    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.num_epochs}")
+    epoch_loss = 0.0
+    num_batches = 0
 
-        for step, batch in enumerate(progress_bar):
-            with torch.cuda.amp.autocast(dtype=dtype) if cfg.device == "cuda" else torch.nullcontext():
-                outputs = model(batch, return_dict=True)
+    for step, batch in enumerate(progress_bar):
+        # ========== 前向 + 损失计算（不变）==========
+        with torch.cuda.amp.autocast(dtype=dtype) if cfg.device == "cuda" else torch.nullcontext():
+            outputs = model(batch, return_dict=True)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            labels = batch["labels"]
 
-                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-                labels = batch["labels"]
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous().long()
 
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().long()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+            loss = loss / cfg.gradient_accumulation_steps
 
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
-                loss = loss / cfg.gradient_accumulation_steps
+        # ========== 反向传播（不变）==========
+        if scaler:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
-            # 反向传播
+        # ========== 关键修改：实时累加和打印 ==========
+        raw_loss = loss.item() * cfg.gradient_accumulation_steps   # 还原真实损失
+        total_loss += raw_loss
+        epoch_loss += raw_loss
+        num_batches += 1
+
+        # 每个 batch 都更新进度条（即时可见）
+        progress_bar.set_postfix({
+            "step_loss": f"{raw_loss:.4f}",      # 当前batch的原始损失
+            "avg_loss": f"{total_loss / min(global_step % cfg.log_steps + 1, cfg.log_steps):.4f}" if global_step > 0 else f"{raw_loss:.4f}",
+            "lr": f"{scheduler.get_last_lr()[0]:.2e}" if global_step > 0 else f"{cfg.learning_rate:.2e}"
+        })
+
+        # ========== 梯度更新（不变）==========
+        if (step + 1) % cfg.gradient_accumulation_steps == 0:
             if scaler:
-                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
 
-            total_loss += loss.item() * cfg.gradient_accumulation_steps
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
 
-            # 梯度更新
-            if (step + 1) % cfg.gradient_accumulation_steps == 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                    optimizer.step()
+            # 每 log_steps 打印一次详细日志（用 print，确保看到）
+            if global_step % cfg.log_steps == 0:
+                avg_loss = total_loss / cfg.log_steps
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"\n[Step {global_step}] avg_loss={avg_loss:.4f} | lr={current_lr:.2e}")
+                total_loss = 0
 
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
+            # 保存检查点（不变）
+            if global_step % cfg.save_steps == 0:
+                save_path = os.path.join(cfg.output_dir, f"checkpoint-{global_step}")
+                os.makedirs(save_path, exist_ok=True)
+                model.save_pretrained(save_path)
+                processor.save_pretrained(save_path)
+                print(f"[Save] 检查点已保存: {save_path}")
 
-                # 日志
-                if global_step % cfg.log_steps == 0:
-                    avg_loss = total_loss / cfg.log_steps
-                    progress_bar.set_postfix({
-                        "loss": f"{avg_loss:.4f}",
-                        "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-                    })
-                    total_loss = 0
-
-                # 保存检查点
-                if global_step % cfg.save_steps == 0:
-                    save_path = os.path.join(cfg.output_dir, f"checkpoint-{global_step}")
-                    os.makedirs(save_path, exist_ok=True)
-                    model.save_pretrained(save_path)
-                    processor.save_pretrained(save_path)
-                    print(f"\n[Save] 检查点已保存: {save_path}")
+    # ========== 新增：每个 epoch 结束打印总结 ==========
+    avg_epoch_loss = epoch_loss / num_batches
+    print(f"\n{'='*50}")
+    print(f"[Epoch {epoch+1}/{cfg.num_epochs}] 平均损失: {avg_epoch_loss:.4f}")
+    print(f"{'='*50}\n")
 
     # 最终保存
     final_path = os.path.join(cfg.output_dir, "final")
