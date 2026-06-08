@@ -558,7 +558,6 @@ def train():
         shuffle=True,
         num_workers=cfg.num_workers,
         collate_fn=ASRDataCollator(processor, str(device), max_length=cfg.max_text_length),
-        pin_memory=True,
     )
 
     # 5. 优化器与调度器
@@ -652,5 +651,8 @@ def train():
     print(f"\n[Done] 最终模型已保存: {final_path}")
 
 
+import multiprocessing
+
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
     train()
