@@ -526,8 +526,9 @@ def train():
         trust_remote_code=cfg.trust_remote_code,
         torch_dtype=dtype,
     ).to(device)
-
-  model.config.stream_input = False
+  
+    
+    model.config.stream_input = False
 
     if hasattr(model, "set_mode"):
         mode_map = {
