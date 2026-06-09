@@ -1,0 +1,79 @@
+Markdown
+复制
+代码
+预览
+# VQ Codec for MiniCPM-o-4.5
+
+基于 MiniCPM-o-4.5 音频子系统的独立 VQ 编解码接口。
+
+- **编码器**: `s3tokenizer` (`speech_tokenizer_v2_25hz`)
+- **解码器**: `stepaudio2` (`Token2wav`)
+
+## 依赖安装
+
+```bash
+pip install s3tokenizer stepaudio2-minicpmo soundfile numpy torch
+# 可选
+pip install scipy huggingface_hub
+快速开始
+Python API
+Python
+from vq_codec import VQCodec
+
+# 初始化（自动复用 MiniCPM-o-4.5 目录）
+codec = VQCodec(model_dir="/path/to/MiniCPM-o-4.5")
+
+# 编码: 音频 -> VQ Tokens
+tokens = codec.encode("input.wav")  # np.ndarray, shape (N,)
+
+# 解码: VQ Tokens -> 音频 (24kHz)
+waveform = codec.decode(
+    tokens,
+    prompt_wav_path="input.wav",   # 参考音频，保持音色一致
+    add_silence_prefix=True,        # 加 3 个 silence token (4218)，与 MiniCPM-o 行为一致
+)
+
+# 保存
+import soundfile as sf
+sf.write("output.wav", waveform, 24000)
+
+# 一键闭环测试
+from vq_codec import test_codec
+result = test_codec("input.wav", model_dir="/path/to/MiniCPM-o-4.5")
+命令行
+bash
+python vq_codec.py \
+    --audio ./test.wav \
+    --model_dir /path/to/MiniCPM-o-4.5 \
+    --output_dir ./test_out
+输出文件
+测试后会生成以下文件：
+表格
+文件	说明
+original.wav	原始音频副本 (16kHz)
+reconstructed.wav	解码后的音频 (24kHz)
+vq_tokens.npy	VQ token 数组
+report.txt	对比指标 (MSE/SNR/CORR)
+重要说明
+1. 编码器与解码器是分离的
+编码器 (s3tokenizer) 用于训练时提取音频的 VQ 表示
+解码器 (Token2wav) 用于推理时把 TTS 生成的 token 转成音频
+两者不是严格互逆：编码器提取的是真实音频的码本索引，而解码器训练时主要见过 TTS 模型生成的 token 分布。闭环重建的音质取决于分布匹配程度。
+2. prompt_wav_path 必须传入
+Token2wav 是流式声码器，依赖参考音频提取音色缓存。解码时强烈建议传入与编码相同的音频作为 prompt_wav_path，否则音色会完全跑偏。
+3. silence token 前缀
+MiniCPM-o 原生 pipeline 在解码前会自动添加 [4218] * 3 作为 silence 前缀。decode() 默认启用此行为（add_silence_prefix=True），如果重建异常可尝试关闭。
+4. 模型路径解析
+model_dir 支持三种形式：
+本地绝对路径: /path/to/MiniCPM-o-4.5（自动找 assets/token2wav 子目录）
+HF Hub repo_id: openbmb/MiniCPM-o-4_5（自动下载缓存）
+None: 自动从 HuggingFace 下载 openbmb/MiniCPM-o-4_5
+如果 s3tokenizer 和 Token2wav 不在同一目录，可分别指定：
+Python
+codec = VQCodec(
+    s3tokenizer_dir="/path/to/s3tokenizer",
+    token2wav_dir="/path/to/token2wav",
+)
+plain
+
+把这两个文件保存到同一目录即可直接运行。
