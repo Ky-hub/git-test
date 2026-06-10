@@ -44,6 +44,7 @@ training:
   max_grad_norm: 1.0
   num_workers: 4
   max_text_length: 256
+  debug_mode: true  
 
 output_dir: "./minicpmo_asr_finetuned"
 save_steps: 500
