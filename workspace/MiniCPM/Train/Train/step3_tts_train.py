@@ -107,6 +107,8 @@ class TrainConfig:
     freeze_tts: bool = False
     unfreeze_llm_layers: Optional[List[int]] = None
 
+    debug_mode: bool = False
+
     output_dir: str = "./minicpmo_tts_finetuned"
     data: DataConfig = field(default_factory=DataConfig)
 
