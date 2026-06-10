@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MiniCPM-o-4.5 TTS 训练脚本（修正版）
+MiniCPM-o-4.5 TTS 训练脚本（最终修正版）
 关键修正：
-  1. special token 拼写：||<|tts_bos|> 而非 ||<<||<<||<|tts_bos|>
-  2. labels 精确 mask：只计算 assistant 回复部分的 loss
-  3. debug 只对比 assistant 部分的真值 vs 预测
+  1. special token 拼写：|<|tts_bos|> 而非 ||<|tts_bos|>
+  2. labels 精确 mask：在 input_ids 中定位 <|tts_bos|>，不再依赖字符串 encode
+  3. TTS slice 对齐：跳过 <|tts_bos|> 本身，与推理侧 tts_bos_idx = i + 1 对齐
 """
 
 import os
@@ -60,7 +60,7 @@ except ImportError:
         spec_vq.loader.exec_module(vq_codec_mod)
         VQCodec = vq_codec_mod.VQCodec
     else:
-        raise ImportError("找不到 vq_codec.py")
+        raise ImportError("找不到 vq_codec.py，请将其放置于同目录")
 
 try:
     import librosa
@@ -302,10 +302,10 @@ class TTSDataset(Dataset):
         user_cur_msgs.append("请复述这段语音。")
         msgs.append({"role": "user", "content": "".join(user_cur_msgs)})
 
-        # 修正 1：正确的 special token 拼写
+        # 修正：正确的 special token 拼写，去掉多余的 ||
         msgs.append({
             "role": "assistant",
-            "content": f"||<|tts_bos|>{item['text']}||<|tts_eos|>"
+            "content": f"<|tts_bos|>{item['text']}<|tts_eos|>"
         })
 
         # 生成完整 prompt
@@ -313,7 +313,7 @@ class TTSDataset(Dataset):
             msgs, tokenize=False, add_generation_prompt=False
         )
 
-        # 生成 prefix prompt（不含 assistant，用于计算 labels mask）
+        # 生成 prefix prompt（不含 assistant，用于辅助定位 assistant 边界）
         prefix_msgs = msgs[:-1]
         prefix_prompt = self.processor.tokenizer.apply_chat_template(
             prefix_msgs, tokenize=False, add_generation_prompt=False
@@ -331,7 +331,6 @@ class TTSDataset(Dataset):
 
 
 # ==================== DataCollator（核心修正） ====================
-
 class TTSDataCollator:
     def __init__(self, processor: MiniCPMOProcessor, device: str, vq_codec: VQCodec, max_length: int = 512):
         self.processor = processor
@@ -361,11 +360,11 @@ class TTSDataCollator:
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
-        # 修正 2：正确的 special token ID
-        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|tts_bos|>")
-        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|tts_eos|>")
+        # 正确的 special token ID
+        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|tts_eos|>")
 
-        # 查找 TTS bounds
+        # 查找 TTS bounds（供 compute_tts_loss 使用）
         tts_bounds = []
         for b in range(input_ids.shape[0]):
             ids = input_ids[b].tolist()
@@ -387,19 +386,28 @@ class TTSDataCollator:
             tokens = self.vq_codec.encode(audio)
             target_vq_tokens.append(tokens)
 
-        # 修正 3：精确的 labels mask（只计算 assistant 部分）
+        # 修正：精确的 labels mask
         labels = input_ids.clone().long()
         pad_token_id = self.processor.tokenizer.pad_token_id or 0
 
         for b in range(input_ids.shape[0]):
-            # 计算 prefix 长度（system + user 的 token 数）
-            prefix_ids = self.processor.tokenizer.encode(prefix_prompts[b], add_special_tokens=False)
-            prefix_len = len(prefix_ids)
-
-            # 将 prefix 部分设为 -100（不计算 loss）
-            labels[b, :prefix_len] = -100
-
-            # padding 部分也 mask
+            ids = input_ids[b].tolist()
+            
+            # mask <|tts_bos|> 及之前的所有内容（输入侧，不是生成目标）
+            try:
+                bos_pos = ids.index(tts_bos_token_id)
+                labels[b, :bos_pos + 1] = -100
+            except ValueError:
+                labels[b, :] = -100
+            
+            # mask <|tts_eos|> 之后的所有内容（终止符之后无意义）
+            try:
+                eos_pos = ids.index(tts_eos_token_id)
+                labels[b, eos_pos + 1 :] = -100
+            except ValueError:
+                pass
+            
+            # mask padding
             labels[b, input_ids[b] == pad_token_id] = -100
 
         model_inputs = {
@@ -418,7 +426,6 @@ class TTSDataCollator:
         }
 
         return {k: v for k, v in model_inputs.items() if v is not None}
-
 
 # ==================== 冻结策略 ====================
 
@@ -493,8 +500,9 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
             continue
 
         sample_input_ids = batch["input_ids"][b]
-        llm_tokens = sample_input_ids[bos_idx:eos_idx]
-        llm_hidden = llm_hidden_states[b, bos_idx:eos_idx, :]
+        # 修正：跳过 tts_bos 本身，与推理侧 tts_bos_idx = i + 1 严格对齐
+        llm_tokens = sample_input_ids[bos_idx + 1 : eos_idx]
+        llm_hidden = llm_hidden_states[b, bos_idx + 1 : eos_idx, :]
 
         if llm_tokens.numel() == 0 or llm_hidden.shape[0] == 0:
             continue
@@ -546,7 +554,7 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
             output_hidden_states=False,
         )
 
-        audio_hidden = tts_outputs.last_hidden_state[:, condition.shape[1] - 1:, :]
+        audio_hidden = tts_outputs.last_hidden_state[:, condition.shape[1] - 1 :, :]
 
         loss_b = 0
         for q in range(tts.num_vq):
@@ -706,7 +714,7 @@ def train():
             else:
                 loss.backward()
 
-            # ========== 修正 4：debug 只对比 assistant 部分 ==========
+            # Debug：只对比 assistant 部分的真值 vs 预测
             if cfg.debug_mode and global_step % cfg.log_steps == 0:
                 with torch.no_grad():
                     labels_sample = batch["labels"][0]
@@ -722,7 +730,7 @@ def train():
                         raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
 
                         # 预测：logits 在 [start_idx-1:end_idx-1] 对应预测 labels[start_idx:end_idx]
-                        pred_logits = llm_logits[0, start_idx-1:end_idx-1, :]
+                        pred_logits = llm_logits[0, start_idx - 1 : end_idx - 1, :]
                         pred_token_ids = pred_logits.argmax(dim=-1).cpu().tolist()
                         pred_text = processor.tokenizer.decode(pred_token_ids, skip_special_tokens=False)
 
