@@ -700,6 +700,29 @@ def train():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+            
+            if cfg.debug_mode and global_step % cfg.log_steps == 0:
+                with torch.no_grad():
+                    # 1. 从 labels 还原原始文本（去掉 -100 padding）
+                    valid_mask = labels[0] != -100
+                    raw_token_ids = labels[0][valid_mask].cpu().tolist()
+                    raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
+                    
+                    # 2. 从 logits 取 greedy 解码得到模型预测
+                    pred_token_ids = llm_logits[0].argmax(dim=-1).cpu().tolist()
+                    # 只取与 labels 等长的有效部分，避免看到 padding 的预测
+                    pred_text = processor.tokenizer.decode(pred_token_ids[:len(raw_token_ids)], skip_special_tokens=False)
+                    
+                    # 3. 打印 TTS 区间信息
+                    bos_idx, eos_idx = tts_bounds[0] if tts_bounds else (-1, -1)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"[DEBUG Step {global_step}] TTS bounds: ({bos_idx}, {eos_idx})")
+                    print(f"[DEBUG] 原始文本 (labels):")
+                    print(f"  {raw_text[:300]}{'...' if len(raw_text)>300 else ''}")
+                    print(f"[DEBUG] LLM 预测 (greedy):")
+                    print(f"  {pred_text[:300]}{'...' if len(pred_text)>300 else ''}")
+                    print(f"{'='*60}\n")
 
             # --- 记录 ---
             raw_loss = loss.item() * cfg.gradient_accumulation_steps
