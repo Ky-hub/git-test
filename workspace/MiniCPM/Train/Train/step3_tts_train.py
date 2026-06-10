@@ -2,14 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 MiniCPM-o-4.5 端到端 TTS 微调训练脚本（语音到语音复述）
-修正点：
-  - 显式传入 audio_parts_list，确保 Processor 正确插入音频 embedding
-  - 音频数组不直接放入 msgs，而是替换为 <audio>./</audio> 占位符
+整合修正：
+  - 音频占位符 + audio_parts 显式传入 Processor
+  - num_workers 强制为 0（VQCodec 不可序列化）
+  - 双路日志：文件详细记录，控制台简洁
+  - debug_mode 开关控制文本对比日志
 """
 
 import os
 import sys
 import importlib.util
+import logging
+from datetime import datetime
 from enum import Enum
 import json
 import yaml
@@ -107,8 +111,6 @@ class TrainConfig:
     freeze_tts: bool = False
     unfreeze_llm_layers: Optional[List[int]] = None
 
-    debug_mode: bool = False
-
     output_dir: str = "./minicpmo_tts_finetuned"
     data: DataConfig = field(default_factory=DataConfig)
 
@@ -122,6 +124,7 @@ class TrainConfig:
     num_workers: int = 0
     max_text_length: int = 512
 
+    debug_mode: bool = False      # ← 调试开关
     tts_loss_weight: float = 1.0
     text_loss_weight: float = 0.1
 
@@ -165,7 +168,7 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
 
     float_fields = ["learning_rate", "weight_decay", "warmup_ratio", "max_grad_norm", "tts_loss_weight", "text_loss_weight"]
     int_fields = ["batch_size", "gradient_accumulation_steps", "num_epochs", "num_workers", "max_text_length", "save_steps", "log_steps", "max_audio_length", "max_target_audio_length"]
-    bool_fields = ["freeze_llm", "freeze_vision", "freeze_audio", "freeze_tts", "trust_remote_code"]
+    bool_fields = ["freeze_llm", "freeze_vision", "freeze_audio", "freeze_tts", "trust_remote_code", "debug_mode"]
 
     for k in float_fields:
         if k in top_fields and isinstance(top_fields[k], str):
@@ -182,14 +185,12 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
     return TrainConfig(data=data_cfg, **top_fields)
 
 
-# ==================== TTS 数据集（修正版） ====================
+# ==================== TTS 数据集 ====================
 
 class TTSDataset(Dataset):
     """
     TTS 数据集（语音到语音复述）
-    关键修正：
-      - 音频数组不直接放入 msgs content，而是替换为 <audio>./</audio> 占位符
-      - 音频数组单独收集，由 Processor 后续编码
+    音频数组不直接放入 msgs，而是替换为 <audio>./</audio> 占位符
     """
 
     def __init__(self, task_cfg: TTSDataConfig, processor: MiniCPMOProcessor, config: TrainConfig, split: str = "train"):
@@ -304,27 +305,24 @@ class TTSDataset(Dataset):
             or "请复述用户提供的语音内容。"
         )
 
-        # 构建 msgs：音频替换为占位符，音频数组单独收集
+        # 构建 msgs：音频替换为占位符，content 必须是字符串
         audios = []
         audio_parts = []
 
         msgs = [{"role": "system", "content": system_text}]
 
-        # user message：音频 + 文本，但 content 必须是字符串（Jinja2 模板要求）
         user_cur_msgs = []
-        user_cur_msgs.append("<audio>./</audio>")  # 音频占位符
+        user_cur_msgs.append("<audio>./</audio>")  # 占位符
         audios.append(input_waveform)
-        audio_parts.append(1)  # 第 1 个 message（index=1，即 user）包含音频
+        audio_parts.append(1)  # 第 1 个 message（user）包含音频
         user_cur_msgs.append("请复述这段语音。")
         msgs.append({"role": "user", "content": "".join(user_cur_msgs)})
 
-        # assistant message：纯文本，包含 TTS 标记
         msgs.append({
             "role": "assistant",
             "content": f"||<<||<|tts_bos|>{item['text']}<<||<<||<|tts_eos|>"
         })
 
-        # 应用 chat template（此时 content 全是字符串，不会触发 Jinja2 报错）
         prompt = self.processor.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
@@ -341,13 +339,11 @@ class TTSDataset(Dataset):
         }
 
 
-# ==================== DataCollator（修正版） ====================
+# ==================== DataCollator ====================
 
 class TTSDataCollator:
     """
-    TTS 数据整理器：
-      - 显式传入 audios 和 audio_parts_list，由 Processor 编码音频 embedding
-      - 构建 labels 与 TTS 目标 VQ tokens
+    显式传入 audios 和 audio_parts_list，由 Processor 编码音频 embedding
     """
 
     def __init__(self, processor: MiniCPMOProcessor, device: str, vq_codec: VQCodec, max_length: int = 512):
@@ -358,16 +354,15 @@ class TTSDataCollator:
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         prompts = [item["prompt"] for item in batch]
-        audios_list = [item["audios"] for item in batch]          # 每个样本的音频数组列表
-        audio_parts_list = [item["audio_parts"] for item in batch]  # 每个样本的 audio_parts
+        audios_list = [item["audios"] for item in batch]
+        audio_parts_list = [item["audio_parts"] for item in batch]
         target_audios = [item["target_audio"] for item in batch]
 
-        # 关键修正：显式传入 audios 和 audio_parts_list
         inputs = self.processor(
             prompts,
-            [[] for _ in batch],      # images
-            audios_list,               # audios：list of list of np.ndarray
-            audio_parts_list,          # audio_parts：list of list of int
+            [[] for _ in batch],
+            audios_list,
+            audio_parts_list,
             return_tensors="pt",
             max_length=self.max_length,
             padding=True,
@@ -377,7 +372,6 @@ class TTSDataCollator:
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
-        # 定位 <|tts_bos|> 和 <|tts_eos|>
         tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<<||<|tts_bos|>")
         tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<<||<|tts_eos|>")
 
@@ -396,13 +390,11 @@ class TTSDataCollator:
                 eos_idx = -1
             tts_bounds.append((bos_idx, eos_idx))
 
-        # 编码目标音频为 VQ tokens
         target_vq_tokens = []
         for audio in target_audios:
             tokens = self.vq_codec.encode(audio)
             target_vq_tokens.append(tokens)
 
-        # 文本 labels（Causal LM）
         labels = input_ids.clone().long()
         pad_token_id = self.processor.tokenizer.pad_token_id or 0
         labels[labels == pad_token_id] = -100
@@ -578,18 +570,40 @@ def train():
     cfg = load_config("config.yaml")
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    # 强制单进程（VQCodec 不可序列化）
+    # ========== 日志配置：文件详细 + 控制台简洁 ==========
+    logger = logging.getLogger("tts_train")
+    logger.setLevel(logging.DEBUG if cfg.debug_mode else logging.INFO)
+
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    log_file = os.path.join(cfg.output_dir, f"train_{datetime.now().strftime('%m%d_%H%M%S')}.log")
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.ERROR)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(console_handler)
+
+    logger.info(f"Training started. Log file: {log_file}")
+    logger.info(f"Config: {cfg}")
+
+    # 强制单进程
     if cfg.num_workers > 0:
-        print("[WARN] VQCodec 包含 onnxruntime 对象，强制 num_workers=0")
+        logger.warning("VQCodec 不可序列化，强制 num_workers=0")
         cfg.num_workers = 0
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, cfg.torch_dtype, torch.bfloat16)
 
     # 1. 初始化 VQ 编解码器
-    print("=" * 60)
-    print("正在初始化 VQ 编解码器...")
-    print("=" * 60)
+    logger.info("正在初始化 VQ 编解码器...")
     vq_codec = VQCodec(
         model_dir=cfg.model_name_or_path,
         device=str(device),
@@ -597,10 +611,7 @@ def train():
     )
 
     # 2. 加载模型
-    print("=" * 60)
-    print("正在加载 MiniCPM-o-4.5...")
-    print("=" * 60)
-
+    logger.info("正在加载 MiniCPM-o-4.5...")
     model = MiniCPMO.from_pretrained(
         cfg.model_name_or_path,
         trust_remote_code=cfg.trust_remote_code,
@@ -677,7 +688,6 @@ def train():
                 llm_logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                 llm_hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else None
 
-                # 文本 Loss（Causal LM）
                 labels = batch["labels"]
                 shift_logits = llm_logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous().long()
@@ -688,12 +698,10 @@ def train():
                     ignore_index=-100,
                 )
 
-                # TTS Loss
                 tts_loss = torch.tensor(0.0, device=device)
                 if llm_hidden_states is not None and cfg.tts_loss_weight > 0:
                     tts_loss = compute_tts_loss(model, batch, llm_hidden_states)
 
-                # 总 Loss
                 loss = text_loss * cfg.text_loss_weight + tts_loss * cfg.tts_loss_weight
                 loss = loss / cfg.gradient_accumulation_steps
 
@@ -702,29 +710,30 @@ def train():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
+
+            # ========== 调试日志：原始文本 vs LLM 输出 ==========
             if cfg.debug_mode and global_step % cfg.log_steps == 0:
                 with torch.no_grad():
-                    # 1. 从 labels 还原原始文本（去掉 -100 padding）
                     valid_mask = labels[0] != -100
                     raw_token_ids = labels[0][valid_mask].cpu().tolist()
                     raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
-                    
-                    # 2. 从 logits 取 greedy 解码得到模型预测
+
                     pred_token_ids = llm_logits[0].argmax(dim=-1).cpu().tolist()
-                    # 只取与 labels 等长的有效部分，避免看到 padding 的预测
                     pred_text = processor.tokenizer.decode(pred_token_ids[:len(raw_token_ids)], skip_special_tokens=False)
-                    
-                    # 3. 打印 TTS 区间信息
-                    bos_idx, eos_idx = batch["tts_bounds"][0] if batch["tts_bounds"] else (-1, -1)
-                    
-                    print(f"\n{'='*60}")
-                    print(f"[DEBUG Step {global_step}] TTS bounds: ({bos_idx}, {eos_idx})")
-                    print(f"[DEBUG] 原始文本 (labels):")
-                    print(f"  {raw_text[:300]}{'...' if len(raw_text)>300 else ''}")
-                    print(f"[DEBUG] LLM 预测 (greedy):")
-                    print(f"  {pred_text[:300]}{'...' if len(pred_text)>300 else ''}")
-                    print(f"{'='*60}\n")
+
+                    tts_bounds = batch.get("tts_bounds", [])
+                    bos_idx, eos_idx = tts_bounds[0] if tts_bounds else (-1, -1)
+
+                    logger.info("=" * 60)
+                    logger.info(f"[DEBUG Step {global_step}] TTS bounds: ({bos_idx}, {eos_idx})")
+                    logger.info(f"[DEBUG] 原始文本 ({len(raw_token_ids)} tokens):")
+                    logger.info(raw_text[:500])
+                    logger.info(f"[DEBUG] LLM 预测 ({len(pred_token_ids)} tokens):")
+                    logger.info(pred_text[:500])
+                    logger.info("=" * 60)
+
+                    if bos_idx < 0 or eos_idx < 0:
+                        logger.warning(f"TTS bounds 异常: {tts_bounds}，请检查 special token")
 
             # --- 记录 ---
             raw_loss = loss.item() * cfg.gradient_accumulation_steps
@@ -766,7 +775,7 @@ def train():
                     avg_text = total_text_loss / cfg.log_steps
                     avg_tts = total_tts_loss / cfg.log_steps
                     current_lr = scheduler.get_last_lr()[0]
-                    print(f"\n[Step {global_step}] loss={avg_loss:.4f} text={avg_text:.4f} tts={avg_tts:.4f} lr={current_lr:.2e}")
+                    logger.info(f"[Step {global_step}] loss={avg_loss:.4f} text={avg_text:.4f} tts={avg_tts:.4f} lr={current_lr:.2e}")
                     total_loss = 0
                     total_text_loss = 0
                     total_tts_loss = 0
@@ -776,22 +785,20 @@ def train():
                     os.makedirs(save_path, exist_ok=True)
                     model.save_pretrained(save_path)
                     processor.save_pretrained(save_path)
-                    print(f"[Save] 检查点已保存: {save_path}")
+                    logger.info(f"[Save] 检查点已保存: {save_path}")
 
         # Epoch 总结
         avg_epoch_loss = epoch_loss / num_batches
         avg_epoch_text = epoch_text_loss / num_batches
         avg_epoch_tts = epoch_tts_loss / num_batches
-        print(f"\n{'='*50}")
-        print(f"[Epoch {epoch+1}/{cfg.num_epochs}] loss={avg_epoch_loss:.4f} text={avg_epoch_text:.4f} tts={avg_epoch_tts:.4f}")
-        print(f"{'='*50}\n")
+        logger.info(f"[Epoch {epoch+1}/{cfg.num_epochs}] loss={avg_epoch_loss:.4f} text={avg_epoch_text:.4f} tts={avg_epoch_tts:.4f}")
 
     # 最终保存
     final_path = os.path.join(cfg.output_dir, "final")
     os.makedirs(final_path, exist_ok=True)
     model.save_pretrained(final_path)
     processor.save_pretrained(final_path)
-    print(f"\n[Done] 最终模型已保存: {final_path}")
+    logger.info(f"[Done] 最终模型已保存: {final_path}")
 
 
 import multiprocessing
