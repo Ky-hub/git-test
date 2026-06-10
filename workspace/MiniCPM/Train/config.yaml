@@ -23,6 +23,16 @@ data:
       - "batch_2024_01"
       - "batch_2024_02"
     max_audio_length: 30
+    
+  tts:
+    task_dir: "data/tts"
+    train_json: "train.json"
+    val_json: null
+    system_prompt_file: "system_prompt.txt"
+    audio_dir: "audio"
+    audio_subdirs: null
+    max_audio_length: 30
+    max_target_audio_length: 30
 
 training:
   batch_size: 2
