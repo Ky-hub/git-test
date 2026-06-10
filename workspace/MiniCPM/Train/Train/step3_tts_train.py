@@ -2,11 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 MiniCPM-o-4.5 端到端 TTS 微调训练脚本（语音到语音复述）
-支持：
-  - 输入音频作为 user prompt，目标音频为同一段音频（复述任务）
-  - LLM + TTS 联合训练（或仅 TTS）
-  - 使用 s3tokenizer + Token2Wav 编码目标音频 VQ tokens
-  - 嵌套配置、外部 system prompt、多子目录音频扫描
+修正点：
+  - 显式传入 audio_parts_list，确保 Processor 知道音频属于哪个 message
 """
 
 import os
@@ -56,7 +53,7 @@ if not hasattr(utils_mod, "normalize_content"):
 from MiniCPMO45.modeling_minicpmo import MiniCPMO
 from MiniCPMO45.processing_minicpmo import MiniCPMOProcessor
 
-# ========== 导入 VQ 编解码器（假设与脚本同级或项目根目录） ==========
+# ========== 导入 VQ 编解码器 ==========
 try:
     from vq_codec import VQCodec
 except ImportError:
@@ -188,8 +185,7 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
 class TTSDataset(Dataset):
     """
     TTS 数据集（语音到语音复述）
-    输入音频作为 user content，目标音频为同一段音频（复述）
-    assistant 文本包含 <|tts_bos|> 转录文本 <|tts_eos|>
+    关键修正：显式记录 audio_parts，告知 Processor 音频属于哪个 message
     """
 
     def __init__(self, task_cfg: TTSDataConfig, processor: MiniCPMOProcessor, config: TrainConfig, split: str = "train"):
@@ -304,12 +300,16 @@ class TTSDataset(Dataset):
             or "请复述用户提供的语音内容。"
         )
 
-        # 构建对话：user 包含音频 + 指令，assistant 包含 TTS 标记的文本
+        # 构建对话：user 的 content 是 list，包含音频 + 文本
         msgs = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": [input_waveform, "请复述这段语音。"]},
-            {"role": "assistant", "content": f"|<|tts_bos|>{item['text']}<|<|tts_eos|>"}
+            {"role": "system", "content": system_text},                           # index 0
+            {"role": "user", "content": [input_waveform, "请复述这段语音。"]},   # index 1，包含音频
+            {"role": "assistant", "content": f"||<|<|tts_bos|>{item['text']}<<||<|<|tts_eos|>"}  # index 2
         ]
+
+        # 关键修正：显式记录音频属于第 1 个 message（user）
+        # 这样 Processor 才能正确将音频 embedding 替换到 <audio>./</audio> 的位置
+        audio_parts = [1]
 
         prompt = self.processor.tokenizer.apply_chat_template(
             msgs,
@@ -323,12 +323,19 @@ class TTSDataset(Dataset):
             "target_audio": target_waveform.copy(),
             "text": item["text"],
             "audio_path": audio_path,
+            "audio_parts": audio_parts,  # 新增：显式携带
         }
 
 
-# ==================== DataCollator ====================
+# ==================== DataCollator（修正版） ====================
 
 class TTSDataCollator:
+    """
+    TTS 数据整理器：
+      - 显式传入 audio_parts_list，确保 Processor 正确插入音频 embedding
+      - 构建 labels 与 TTS 目标 VQ tokens
+    """
+
     def __init__(self, processor: MiniCPMOProcessor, device: str, vq_codec: VQCodec, max_length: int = 512):
         self.processor = processor
         self.device = device
@@ -339,11 +346,14 @@ class TTSDataCollator:
         prompts = [item["prompt"] for item in batch]
         input_audios = [item["audio"] for item in batch]
         target_audios = [item["target_audio"] for item in batch]
+        audio_parts_list = [item["audio_parts"] for item in batch]  # 新增：收集 audio_parts
 
+        # 关键修正：显式传入 audio_parts_list
         inputs = self.processor(
             prompts,
-            [[] for _ in batch],
-            [[audio] for audio in input_audios],
+            [[] for _ in batch],                      # images
+            [[audio] for audio in input_audios],      # audios
+            audio_parts_list,                           # 新增：音频所属 message 索引
             return_tensors="pt",
             max_length=self.max_length,
             padding=True,
@@ -354,8 +364,8 @@ class TTSDataCollator:
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
         # 定位 <|tts_bos|> 和 <|tts_eos|>
-        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("|<|tts_bos|>")
-        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("|<|tts_eos|>")
+        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|<|tts_bos|>")
+        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|<|tts_eos|>")
 
         tts_bounds = []
         for b in range(input_ids.shape[0]):
@@ -460,10 +470,6 @@ def apply_freeze_strategy(model: MiniCPMO, cfg: TrainConfig):
 # ==================== TTS Loss 计算 ====================
 
 def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tensor) -> torch.Tensor:
-    """
-    基于 LLM hidden states 构建 TTS 条件，使用 teacher forcing 计算目标 VQ tokens 的 CE loss。
-    逐样本处理，避免不同长度 VQ tokens 的 batch padding 复杂性。
-    """
     device = llm_hidden_states.device
     tts = model.tts
     tts_bounds = batch["tts_bounds"]
@@ -477,7 +483,6 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
         if bos_idx < 0 or eos_idx <= bos_idx:
             continue
 
-        # 提取该样本的 LLM tokens 和 hidden states
         sample_input_ids = batch["input_ids"][b]
         llm_tokens = sample_input_ids[bos_idx:eos_idx]
         llm_hidden = llm_hidden_states[b, bos_idx:eos_idx, :]
@@ -485,20 +490,16 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
         if llm_tokens.numel() == 0 or llm_hidden.shape[0] == 0:
             continue
 
-        # 构建 TTS 文本 embeddings
         llm_embeds = tts.emb_text(llm_tokens)
 
-        # 投影并归一化 hidden states
         proj_hidden = tts.projector_semantic(llm_hidden)
         if getattr(tts.config, "normalize_projected_hidden", False):
             proj_hidden = F.normalize(proj_hidden, p=2, dim=-1)
 
         tts_embeds = llm_embeds + proj_hidden
 
-        # Speaker embeds（空，音色信息由输入音频经 LLM 编码传递）
         spk_embeds = torch.zeros(0, tts.config.hidden_size, device=device, dtype=tts_embeds.dtype)
 
-        # text_eos + audio_bos
         text_eos_id = getattr(tts.config, "text_eos_token_id", 2)
         audio_bos_id = getattr(tts, "audio_bos_token_id", 1)
 
@@ -507,12 +508,10 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
 
         condition = torch.cat([spk_embeds, tts_embeds, text_eos_embed, audio_bos_embed], dim=0).unsqueeze(0)
 
-        # 目标 VQ tokens
         target_tokens = torch.from_numpy(target_vq_tokens[b]).long().to(device)
 
-        # 适配 num_vq：s3tokenizer 输出 1D，扩展为 TTS 需要的 num_vq
         if target_tokens.dim() == 1:
-            target_tokens = target_tokens.unsqueeze(1)  # [seq_len, 1]
+            target_tokens = target_tokens.unsqueeze(1)
         if target_tokens.shape[1] < tts.num_vq:
             target_tokens = target_tokens.repeat(1, tts.num_vq)
         elif target_tokens.shape[1] > tts.num_vq:
@@ -522,8 +521,6 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
         if seq_len == 0:
             continue
 
-        # Teacher forcing：输入 condition + target[:-1] 的 embeddings
-        # audio_bos（condition 最后一个 token）负责预测 target[0]
         audio_input = target_tokens[:-1, :].unsqueeze(0) if seq_len > 1 else torch.zeros(1, 0, tts.num_vq, device=device, dtype=torch.long)
         audio_embeds = []
         for q in range(tts.num_vq):
@@ -533,7 +530,6 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
         full_embeds = torch.cat([condition, audio_embeds], dim=1)
         position_ids = torch.arange(full_embeds.shape[1], device=device).unsqueeze(0)
 
-        # TTS 模型 forward（不使用 cache，训练模式）
         tts_outputs = tts.model(
             inputs_embeds=full_embeds,
             position_ids=position_ids,
@@ -541,14 +537,12 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
             output_hidden_states=False,
         )
 
-        # 取 hidden states：从 condition 最后一个 token（audio_bos）开始，对应预测 target[0:seq_len]
         audio_hidden = tts_outputs.last_hidden_state[:, condition.shape[1] - 1:, :]
 
-        # 逐 VQ 层计算 cross entropy
         loss_b = 0
         for q in range(tts.num_vq):
-            logits_q = tts.head_code[q](audio_hidden)  # [1, seq_len, num_audio_tokens]
-            targets_q = target_tokens[:, q].unsqueeze(0)  # [1, seq_len]
+            logits_q = tts.head_code[q](audio_hidden)
+            targets_q = target_tokens[:, q].unsqueeze(0)
             loss_b += F.cross_entropy(
                 logits_q.reshape(-1, logits_q.size(-1)),
                 targets_q.reshape(-1),
