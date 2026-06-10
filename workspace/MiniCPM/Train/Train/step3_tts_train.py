@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MiniCPM-o-4.5 端到端 TTS 微调训练脚本（语音到语音复述）
-整合修正：
-  - 音频占位符 + audio_parts 显式传入 Processor
-  - num_workers 强制为 0（VQCodec 不可序列化）
-  - 双路日志：文件详细记录，控制台简洁
-  - debug_mode 开关控制文本对比日志
+MiniCPM-o-4.5 TTS 训练脚本（修正版）
+关键修正：
+  1. special token 拼写：||<|tts_bos|> 而非 ||<<||<<||<|tts_bos|>
+  2. labels 精确 mask：只计算 assistant 回复部分的 loss
+  3. debug 只对比 assistant 部分的真值 vs 预测
 """
 
 import os
@@ -27,18 +26,12 @@ from typing import Optional, List, Dict
 from tqdm import tqdm
 import numpy as np
 
-# ========== 本地定义 ProcessorMode（兼容精简版模型文件） ==========
-class ProcessorMode(Enum):
-    CHAT = "chat"
-    STREAMING = "streaming"
-    DUPLEX = "duplex"
-
 # ========== 路径适配 ==========
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
-# ========== 加载 MiniCPMO45/utils.py 并补充缺失函数（不改原文件） ==========
+# ========== 加载 utils 并补充缺失函数 ==========
 utils_path = os.path.join(PROJECT_ROOT, "MiniCPMO45", "utils.py")
 if not os.path.exists(utils_path):
     raise FileNotFoundError(f"找不到 utils.py: {utils_path}")
@@ -49,10 +42,7 @@ sys.modules["MiniCPMO45.utils"] = utils_mod
 spec.loader.exec_module(utils_mod)
 
 if not hasattr(utils_mod, "normalize_content"):
-    utils_mod.normalize_content = lambda x: (
-        [x] if isinstance(x, str) else (x if isinstance(x, list) else [x])
-    )
-    print("[Patch] 已补充 normalize_content 到 MiniCPMO45.utils")
+    utils_mod.normalize_content = lambda x: [x] if isinstance(x, str) else (x if isinstance(x, list) else [x])
 
 # ========== 导入模型 ==========
 from MiniCPMO45.modeling_minicpmo import MiniCPMO
@@ -70,7 +60,7 @@ except ImportError:
         spec_vq.loader.exec_module(vq_codec_mod)
         VQCodec = vq_codec_mod.VQCodec
     else:
-        raise ImportError("找不到 vq_codec.py，请将其放在项目根目录或 Train/ 目录下")
+        raise ImportError("找不到 vq_codec.py")
 
 try:
     import librosa
@@ -79,6 +69,12 @@ except ImportError:
 
 
 # ==================== 配置类 ====================
+
+class ProcessorMode(Enum):
+    CHAT = "chat"
+    STREAMING = "streaming"
+    DUPLEX = "duplex"
+
 
 @dataclass
 class TTSDataConfig:
@@ -124,7 +120,7 @@ class TrainConfig:
     num_workers: int = 0
     max_text_length: int = 512
 
-    debug_mode: bool = False      # ← 调试开关
+    debug_mode: bool = False
     tts_loss_weight: float = 1.0
     text_loss_weight: float = 0.1
 
@@ -134,7 +130,6 @@ class TrainConfig:
 
 def load_config(path: str = "config.yaml") -> TrainConfig:
     if not os.path.exists(path):
-        print(f"[WARN] 未找到 {path}，使用默认配置")
         return TrainConfig()
 
     with open(path, "r", encoding="utf-8") as f:
@@ -142,7 +137,6 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
 
     training_cfg = raw.get("training", {})
     if not isinstance(training_cfg, dict):
-        print(f"[ERROR] config.yaml 中 'training' 节点格式错误")
         training_cfg = {}
 
     top_fields = {}
@@ -157,12 +151,7 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
             top_fields[k] = v
 
     data_raw = raw.get("data", {})
-    if not isinstance(data_raw, dict):
-        data_raw = {}
-
-    tts_raw = data_raw.get("tts", {})
-    if not isinstance(tts_raw, dict):
-        tts_raw = {}
+    tts_raw = data_raw.get("tts", {}) if isinstance(data_raw, dict) else {}
 
     data_cfg = DataConfig(tts=TTSDataConfig(**tts_raw))
 
@@ -188,11 +177,6 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
 # ==================== TTS 数据集 ====================
 
 class TTSDataset(Dataset):
-    """
-    TTS 数据集（语音到语音复述）
-    音频数组不直接放入 msgs，而是替换为 <audio>./</audio> 占位符
-    """
-
     def __init__(self, task_cfg: TTSDataConfig, processor: MiniCPMOProcessor, config: TrainConfig, split: str = "train"):
         self.processor = processor
         self.config = config
@@ -212,7 +196,7 @@ class TTSDataset(Dataset):
         print(f"[TTSDataset] {split}: 找到 {len(self._audio_path_cache)} 个音频文件")
 
         self._global_system_prompt = self._load_system_prompt()
-        print(f"[TTSDataset] {split}: 加载 {len(self.data)} 条样本 from {json_path}")
+        print(f"[TTSDataset] {split}: 加载 {len(self.data)} 条样本")
 
     def _resolve_path(self, path: str, base: Optional[str] = None) -> str:
         if not path:
@@ -305,32 +289,39 @@ class TTSDataset(Dataset):
             or "请复述用户提供的语音内容。"
         )
 
-        # 构建 msgs：音频替换为占位符，content 必须是字符串
+        # 构建 msgs
         audios = []
         audio_parts = []
 
         msgs = [{"role": "system", "content": system_text}]
 
         user_cur_msgs = []
-        user_cur_msgs.append("<audio>./</audio>")  # 占位符
+        user_cur_msgs.append("<audio>./</audio>")
         audios.append(input_waveform)
-        audio_parts.append(1)  # 第 1 个 message（user）包含音频
+        audio_parts.append(1)
         user_cur_msgs.append("请复述这段语音。")
         msgs.append({"role": "user", "content": "".join(user_cur_msgs)})
 
+        # 修正 1：正确的 special token 拼写
         msgs.append({
             "role": "assistant",
-            "content": f"||<<||<|tts_bos|>{item['text']}<<||<<||<|tts_eos|>"
+            "content": f"||<|tts_bos|>{item['text']}||<|tts_eos|>"
         })
 
-        prompt = self.processor.tokenizer.apply_chat_template(
-            msgs,
-            tokenize=False,
-            add_generation_prompt=False,
+        # 生成完整 prompt
+        full_prompt = self.processor.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False
+        )
+
+        # 生成 prefix prompt（不含 assistant，用于计算 labels mask）
+        prefix_msgs = msgs[:-1]
+        prefix_prompt = self.processor.tokenizer.apply_chat_template(
+            prefix_msgs, tokenize=False, add_generation_prompt=False
         )
 
         return {
-            "prompt": prompt,
+            "prompt": full_prompt,
+            "prefix_prompt": prefix_prompt,
             "audios": audios,
             "audio_parts": audio_parts,
             "target_audio": target_waveform.copy(),
@@ -339,13 +330,9 @@ class TTSDataset(Dataset):
         }
 
 
-# ==================== DataCollator ====================
+# ==================== DataCollator（核心修正） ====================
 
 class TTSDataCollator:
-    """
-    显式传入 audios 和 audio_parts_list，由 Processor 编码音频 embedding
-    """
-
     def __init__(self, processor: MiniCPMOProcessor, device: str, vq_codec: VQCodec, max_length: int = 512):
         self.processor = processor
         self.device = device
@@ -354,10 +341,12 @@ class TTSDataCollator:
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         prompts = [item["prompt"] for item in batch]
+        prefix_prompts = [item["prefix_prompt"] for item in batch]
         audios_list = [item["audios"] for item in batch]
         audio_parts_list = [item["audio_parts"] for item in batch]
         target_audios = [item["target_audio"] for item in batch]
 
+        # Processor 编码
         inputs = self.processor(
             prompts,
             [[] for _ in batch],
@@ -372,9 +361,11 @@ class TTSDataCollator:
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
-        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<<||<|tts_bos|>")
-        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<<||<|tts_eos|>")
+        # 修正 2：正确的 special token ID
+        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|tts_bos|>")
+        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|tts_eos|>")
 
+        # 查找 TTS bounds
         tts_bounds = []
         for b in range(input_ids.shape[0]):
             ids = input_ids[b].tolist()
@@ -390,14 +381,26 @@ class TTSDataCollator:
                 eos_idx = -1
             tts_bounds.append((bos_idx, eos_idx))
 
+        # 编码目标 VQ tokens
         target_vq_tokens = []
         for audio in target_audios:
             tokens = self.vq_codec.encode(audio)
             target_vq_tokens.append(tokens)
 
+        # 修正 3：精确的 labels mask（只计算 assistant 部分）
         labels = input_ids.clone().long()
         pad_token_id = self.processor.tokenizer.pad_token_id or 0
-        labels[labels == pad_token_id] = -100
+
+        for b in range(input_ids.shape[0]):
+            # 计算 prefix 长度（system + user 的 token 数）
+            prefix_ids = self.processor.tokenizer.encode(prefix_prompts[b], add_special_tokens=False)
+            prefix_len = len(prefix_ids)
+
+            # 将 prefix 部分设为 -100（不计算 loss）
+            labels[b, :prefix_len] = -100
+
+            # padding 部分也 mask
+            labels[b, input_ids[b] == pad_token_id] = -100
 
         model_inputs = {
             "input_ids": input_ids.to(self.device),
@@ -473,7 +476,7 @@ def apply_freeze_strategy(model: MiniCPMO, cfg: TrainConfig):
     print(f"\n[Params] Trainable: {trainable:,} / Total: {total:,} ({100*trainable/total:.2f}%)")
 
 
-# ==================== TTS Loss 计算 ====================
+# ==================== TTS Loss ====================
 
 def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tensor) -> torch.Tensor:
     device = llm_hidden_states.device
@@ -570,7 +573,7 @@ def train():
     cfg = load_config("config.yaml")
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    # ========== 日志配置：文件详细 + 控制台简洁 ==========
+    # 日志配置
     logger = logging.getLogger("tts_train")
     logger.setLevel(logging.DEBUG if cfg.debug_mode else logging.INFO)
 
@@ -592,9 +595,7 @@ def train():
     logger.addHandler(console_handler)
 
     logger.info(f"Training started. Log file: {log_file}")
-    logger.info(f"Config: {cfg}")
 
-    # 强制单进程
     if cfg.num_workers > 0:
         logger.warning("VQCodec 不可序列化，强制 num_workers=0")
         cfg.num_workers = 0
@@ -602,7 +603,7 @@ def train():
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, cfg.torch_dtype, torch.bfloat16)
 
-    # 1. 初始化 VQ 编解码器
+    # 初始化 VQ
     logger.info("正在初始化 VQ 编解码器...")
     vq_codec = VQCodec(
         model_dir=cfg.model_name_or_path,
@@ -610,7 +611,7 @@ def train():
         s3tokenizer_name="speech_tokenizer_v2_25hz",
     )
 
-    # 2. 加载模型
+    # 加载模型
     logger.info("正在加载 MiniCPM-o-4.5...")
     model = MiniCPMO.from_pretrained(
         cfg.model_name_or_path,
@@ -624,22 +625,17 @@ def train():
         mode_map = {"chat": ProcessorMode.CHAT, "streaming": ProcessorMode.STREAMING, "duplex": ProcessorMode.DUPLEX}
         model.set_mode(mode_map.get(cfg.mode, ProcessorMode.CHAT))
 
-    # 3. 加载 Processor
+    # 加载 Processor
     processor = MiniCPMOProcessor.from_pretrained(
         cfg.model_name_or_path,
         trust_remote_code=cfg.trust_remote_code,
     )
 
-    # 4. 冻结策略
+    # 冻结策略
     apply_freeze_strategy(model, cfg)
 
-    # 5. 数据集
-    train_dataset = TTSDataset(
-        cfg.data.tts,
-        processor,
-        cfg,
-        split="train",
-    )
+    # 数据集
+    train_dataset = TTSDataset(cfg.data.tts, processor, cfg, split="train")
 
     train_loader = DataLoader(
         train_dataset,
@@ -649,7 +645,7 @@ def train():
         collate_fn=TTSDataCollator(processor, str(device), vq_codec, max_length=cfg.max_text_length),
     )
 
-    # 6. 优化器与调度器
+    # 优化器
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg.learning_rate,
@@ -663,11 +659,10 @@ def train():
         num_training_steps=total_steps,
     )
 
-    # 7. 混合精度
     use_amp = (cfg.device == "cuda" and cfg.torch_dtype == "float16")
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-    # 8. 训练循环
+    # 训练循环
     model.train()
     global_step = 0
     total_loss = 0
@@ -682,7 +677,7 @@ def train():
         num_batches = 0
 
         for step, batch in enumerate(progress_bar):
-            # --- LLM Forward ---
+            # Forward
             with torch.cuda.amp.autocast(dtype=dtype) if cfg.device == "cuda" else torch.nullcontext():
                 outputs = model(batch, return_dict=True, output_hidden_states=True)
                 llm_logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
@@ -705,37 +700,49 @@ def train():
                 loss = text_loss * cfg.text_loss_weight + tts_loss * cfg.tts_loss_weight
                 loss = loss / cfg.gradient_accumulation_steps
 
-            # --- 反向传播 ---
+            # Backward
             if scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            # ========== 调试日志：原始文本 vs LLM 输出 ==========
+            # ========== 修正 4：debug 只对比 assistant 部分 ==========
             if cfg.debug_mode and global_step % cfg.log_steps == 0:
                 with torch.no_grad():
-                    valid_mask = labels[0] != -100
-                    raw_token_ids = labels[0][valid_mask].cpu().tolist()
-                    raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
+                    labels_sample = batch["labels"][0]
+                    valid_mask = labels_sample != -100
+                    valid_positions = torch.where(valid_mask)[0]
 
-                    pred_token_ids = llm_logits[0].argmax(dim=-1).cpu().tolist()
-                    pred_text = processor.tokenizer.decode(pred_token_ids[:len(raw_token_ids)], skip_special_tokens=False)
+                    if len(valid_positions) > 0:
+                        start_idx = valid_positions[0].item()
+                        end_idx = valid_positions[-1].item() + 1
 
-                    tts_bounds = batch.get("tts_bounds", [])
-                    bos_idx, eos_idx = tts_bounds[0] if tts_bounds else (-1, -1)
+                        # 真值：labels 中 valid 的部分
+                        raw_token_ids = labels_sample[start_idx:end_idx].cpu().tolist()
+                        raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
 
-                    logger.info("=" * 60)
-                    logger.info(f"[DEBUG Step {global_step}] TTS bounds: ({bos_idx}, {eos_idx})")
-                    logger.info(f"[DEBUG] 原始文本 ({len(raw_token_ids)} tokens):")
-                    logger.info(raw_text[:500])
-                    logger.info(f"[DEBUG] LLM 预测 ({len(pred_token_ids)} tokens):")
-                    logger.info(pred_text[:500])
-                    logger.info("=" * 60)
+                        # 预测：logits 在 [start_idx-1:end_idx-1] 对应预测 labels[start_idx:end_idx]
+                        pred_logits = llm_logits[0, start_idx-1:end_idx-1, :]
+                        pred_token_ids = pred_logits.argmax(dim=-1).cpu().tolist()
+                        pred_text = processor.tokenizer.decode(pred_token_ids, skip_special_tokens=False)
 
-                    if bos_idx < 0 or eos_idx < 0:
-                        logger.warning(f"TTS bounds 异常: {tts_bounds}，请检查 special token")
+                        tts_bounds = batch.get("tts_bounds", [])
+                        bos_idx, eos_idx = tts_bounds[0] if tts_bounds else (-1, -1)
 
-            # --- 记录 ---
+                        logger.info("=" * 60)
+                        logger.info(f"[DEBUG Step {global_step}] Assistant 区间: [{start_idx}, {end_idx})")
+                        logger.info(f"[DEBUG] TTS bounds (global): ({bos_idx}, {eos_idx})")
+                        logger.info(f"[DEBUG] 真值 ({len(raw_token_ids)} tokens):")
+                        logger.info(raw_text[:500])
+                        logger.info(f"[DEBUG] 预测 ({len(pred_token_ids)} tokens):")
+                        logger.info(pred_text[:500])
+                        logger.info("=" * 60)
+
+                        # 如果 TTS bounds 异常，告警
+                        if bos_idx < 0 or eos_idx < 0:
+                            logger.warning(f"TTS bounds 异常: {tts_bounds}，请检查 special token")
+
+            # 记录
             raw_loss = loss.item() * cfg.gradient_accumulation_steps
             raw_text = text_loss.item()
             raw_tts = tts_loss.item()
@@ -755,7 +762,7 @@ def train():
                 "lr": f"{scheduler.get_last_lr()[0]:.2e}" if global_step > 0 else f"{cfg.learning_rate:.2e}",
             })
 
-            # --- 梯度更新 ---
+            # 梯度更新
             if (step + 1) % cfg.gradient_accumulation_steps == 0:
                 if scaler:
                     scaler.unscale_(optimizer)
