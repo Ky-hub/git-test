@@ -3,7 +3,8 @@
 """
 MiniCPM-o-4.5 端到端 TTS 微调训练脚本（语音到语音复述）
 修正点：
-  - 显式传入 audio_parts_list，确保 Processor 知道音频属于哪个 message
+  - 显式传入 audio_parts_list，确保 Processor 正确插入音频 embedding
+  - 音频数组不直接放入 msgs，而是替换为 <audio>./</audio> 占位符
 """
 
 import os
@@ -77,7 +78,6 @@ except ImportError:
 
 @dataclass
 class TTSDataConfig:
-    """TTS 数据配置"""
     task_dir: str = "data/tts"
     train_json: str = "train.json"
     val_json: Optional[str] = None
@@ -180,12 +180,14 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
     return TrainConfig(data=data_cfg, **top_fields)
 
 
-# ==================== TTS 数据集 ====================
+# ==================== TTS 数据集（修正版） ====================
 
 class TTSDataset(Dataset):
     """
     TTS 数据集（语音到语音复述）
-    关键修正：显式记录 audio_parts，告知 Processor 音频属于哪个 message
+    关键修正：
+      - 音频数组不直接放入 msgs content，而是替换为 <audio>./</audio> 占位符
+      - 音频数组单独收集，由 Processor 后续编码
     """
 
     def __init__(self, task_cfg: TTSDataConfig, processor: MiniCPMOProcessor, config: TrainConfig, split: str = "train"):
@@ -300,17 +302,27 @@ class TTSDataset(Dataset):
             or "请复述用户提供的语音内容。"
         )
 
-        # 构建对话：user 的 content 是 list，包含音频 + 文本
-        msgs = [
-            {"role": "system", "content": system_text},                           # index 0
-            {"role": "user", "content": [input_waveform, "请复述这段语音。"]},   # index 1，包含音频
-            {"role": "assistant", "content": f"||<|<|tts_bos|>{item['text']}<<||<|<|tts_eos|>"}  # index 2
-        ]
+        # 构建 msgs：音频替换为占位符，音频数组单独收集
+        audios = []
+        audio_parts = []
 
-        # 关键修正：显式记录音频属于第 1 个 message（user）
-        # 这样 Processor 才能正确将音频 embedding 替换到 <audio>./</audio> 的位置
-        audio_parts = [1]
+        msgs = [{"role": "system", "content": system_text}]
 
+        # user message：音频 + 文本，但 content 必须是字符串（Jinja2 模板要求）
+        user_cur_msgs = []
+        user_cur_msgs.append("<audio>./</audio>")  # 音频占位符
+        audios.append(input_waveform)
+        audio_parts.append(1)  # 第 1 个 message（index=1，即 user）包含音频
+        user_cur_msgs.append("请复述这段语音。")
+        msgs.append({"role": "user", "content": "".join(user_cur_msgs)})
+
+        # assistant message：纯文本，包含 TTS 标记
+        msgs.append({
+            "role": "assistant",
+            "content": f"||<<||<|tts_bos|>{item['text']}<<||<<||<|tts_eos|>"
+        })
+
+        # 应用 chat template（此时 content 全是字符串，不会触发 Jinja2 报错）
         prompt = self.processor.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
@@ -319,11 +331,11 @@ class TTSDataset(Dataset):
 
         return {
             "prompt": prompt,
-            "audio": input_waveform,
+            "audios": audios,
+            "audio_parts": audio_parts,
             "target_audio": target_waveform.copy(),
             "text": item["text"],
             "audio_path": audio_path,
-            "audio_parts": audio_parts,  # 新增：显式携带
         }
 
 
@@ -332,7 +344,7 @@ class TTSDataset(Dataset):
 class TTSDataCollator:
     """
     TTS 数据整理器：
-      - 显式传入 audio_parts_list，确保 Processor 正确插入音频 embedding
+      - 显式传入 audios 和 audio_parts_list，由 Processor 编码音频 embedding
       - 构建 labels 与 TTS 目标 VQ tokens
     """
 
@@ -344,16 +356,16 @@ class TTSDataCollator:
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         prompts = [item["prompt"] for item in batch]
-        input_audios = [item["audio"] for item in batch]
+        audios_list = [item["audios"] for item in batch]          # 每个样本的音频数组列表
+        audio_parts_list = [item["audio_parts"] for item in batch]  # 每个样本的 audio_parts
         target_audios = [item["target_audio"] for item in batch]
-        audio_parts_list = [item["audio_parts"] for item in batch]  # 新增：收集 audio_parts
 
-        # 关键修正：显式传入 audio_parts_list
+        # 关键修正：显式传入 audios 和 audio_parts_list
         inputs = self.processor(
             prompts,
-            [[] for _ in batch],                      # images
-            [[audio] for audio in input_audios],      # audios
-            audio_parts_list,                           # 新增：音频所属 message 索引
+            [[] for _ in batch],      # images
+            audios_list,               # audios：list of list of np.ndarray
+            audio_parts_list,          # audio_parts：list of list of int
             return_tensors="pt",
             max_length=self.max_length,
             padding=True,
@@ -364,8 +376,8 @@ class TTSDataCollator:
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
         # 定位 <|tts_bos|> 和 <|tts_eos|>
-        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|<|tts_bos|>")
-        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<|<|tts_eos|>")
+        tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<<||<|tts_bos|>")
+        tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("||<<||<|tts_eos|>")
 
         tts_bounds = []
         for b in range(input_ids.shape[0]):
@@ -563,6 +575,11 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
 def train():
     cfg = load_config("config.yaml")
     os.makedirs(cfg.output_dir, exist_ok=True)
+
+    # 强制单进程（VQCodec 不可序列化）
+    if cfg.num_workers > 0:
+        print("[WARN] VQCodec 包含 onnxruntime 对象，强制 num_workers=0")
+        cfg.num_workers = 0
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, cfg.torch_dtype, torch.bfloat16)
