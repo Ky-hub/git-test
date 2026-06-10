@@ -716,7 +716,7 @@ def train():
                     pred_text = processor.tokenizer.decode(pred_token_ids[:len(raw_token_ids)], skip_special_tokens=False)
                     
                     # 3. 打印 TTS 区间信息
-                    bos_idx, eos_idx = tts_bounds[0] if tts_bounds else (-1, -1)
+                    bos_idx, eos_idx = batch["tts_bounds"][0] if batch["tts_bounds"] else (-1, -1)
                     
                     print(f"\n{'='*60}")
                     print(f"[DEBUG Step {global_step}] TTS bounds: ({bos_idx}, {eos_idx})")
