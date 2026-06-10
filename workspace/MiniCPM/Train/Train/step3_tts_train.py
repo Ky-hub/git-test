@@ -120,8 +120,6 @@ class TrainConfig:
     num_workers: int = 0
     max_text_length: int = 512
 
-    debug_mode: bool = False 
-
     tts_loss_weight: float = 1.0
     text_loss_weight: float = 0.1
 
@@ -702,40 +700,6 @@ def train():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            # --- 反向传播 ---
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            # ========== 调试打印：原始文本 vs LLM 输出 ==========
-            if cfg.debug_mode and global_step % cfg.log_steps == 0:
-                with torch.no_grad():
-                    # 原始文本（labels 去掉 -100）
-                    valid_mask = labels[0] != -100
-                    raw_token_ids = labels[0][valid_mask].cpu().tolist()
-                    raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
-                    
-                    # LLM greedy 预测
-                    pred_token_ids = llm_logits[0].argmax(dim=-1).cpu().tolist()
-                    pred_text = processor.tokenizer.decode(pred_token_ids[:len(raw_token_ids)], skip_special_tokens=False)
-                    
-                    # TTS 区间
-                    bos_idx, eos_idx = tts_bounds[0] if tts_bounds else (-1, -1)
-                    
-                    print(f"\n{'='*60}")
-                    print(f"[DEBUG Step {global_step}] TTS bounds: ({bos_idx}, {eos_idx})")
-                    print(f"[DEBUG] 原始文本:")
-                    print(f"  {raw_text[:300]}{'...' if len(raw_text)>300 else ''}")
-                    print(f"[DEBUG] LLM 预测:")
-                    print(f"  {pred_text[:300]}{'...' if len(pred_text)>300 else ''}")
-                    print(f"{'='*60}\n")
-
-            # --- 记录 ---
-            raw_loss = loss.item() * cfg.gradient_accumulation_steps
-            raw_text = text_loss.item()
-            raw_tts = tts_loss.item()
-            # ... 后续不变
 
             # --- 记录 ---
             raw_loss = loss.item() * cfg.gradient_accumulation_steps
