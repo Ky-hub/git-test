@@ -1,32 +1,31 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MiniCPM-o-4.5 TTS 训练脚本（最终修正版）
-关键修正：
-  1. special token 拼写：|<|tts_bos|> 而非 ||<|tts_bos|>
-  2. labels 精确 mask：在 input_ids 中定位 <|tts_bos|>，不再依赖字符串 encode
-  3. TTS slice 对齐：跳过 <|tts_bos|> 本身，与推理侧 tts_bos_idx = i + 1 对齐
+MiniCPM-o-4.5 TTS 训练脚本（完整修正版）
+路径: MiniCPMO45 在上一级目录
+Debug: 只收集 token 和 meta，训练结束后用 offline_decode_batch.py 解码
 """
 
 import os
 import sys
 import importlib.util
 import logging
+import json
 from datetime import datetime
 from enum import Enum
-import json
+from typing import Optional, List, Dict, Tuple
+
 import yaml
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from transformers import get_cosine_schedule_with_warmup
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
 from tqdm import tqdm
-import numpy as np
 
-# ========== 路径适配 ==========
+# ========== 路径适配（MiniCPMO45 在上一级目录） ==========
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
@@ -66,6 +65,11 @@ try:
     import librosa
 except ImportError:
     raise ImportError("请安装 librosa: pip install librosa soundfile")
+
+try:
+    import soundfile as sf
+except ImportError:
+    raise ImportError("请安装 soundfile: pip install soundfile")
 
 
 # ==================== 配置类 ====================
@@ -155,9 +159,19 @@ def load_config(path: str = "config.yaml") -> TrainConfig:
 
     data_cfg = DataConfig(tts=TTSDataConfig(**tts_raw))
 
-    float_fields = ["learning_rate", "weight_decay", "warmup_ratio", "max_grad_norm", "tts_loss_weight", "text_loss_weight"]
-    int_fields = ["batch_size", "gradient_accumulation_steps", "num_epochs", "num_workers", "max_text_length", "save_steps", "log_steps", "max_audio_length", "max_target_audio_length"]
-    bool_fields = ["freeze_llm", "freeze_vision", "freeze_audio", "freeze_tts", "trust_remote_code", "debug_mode"]
+    float_fields = [
+        "learning_rate", "weight_decay", "warmup_ratio", "max_grad_norm",
+        "tts_loss_weight", "text_loss_weight",
+    ]
+    int_fields = [
+        "batch_size", "gradient_accumulation_steps", "num_epochs", "num_workers",
+        "max_text_length", "save_steps", "log_steps",
+        "max_audio_length", "max_target_audio_length",
+    ]
+    bool_fields = [
+        "freeze_llm", "freeze_vision", "freeze_audio", "freeze_tts",
+        "trust_remote_code", "debug_mode",
+    ]
 
     for k in float_fields:
         if k in top_fields and isinstance(top_fields[k], str):
@@ -289,7 +303,6 @@ class TTSDataset(Dataset):
             or "请复述用户提供的语音内容。"
         )
 
-        # 构建 msgs
         audios = []
         audio_parts = []
 
@@ -302,18 +315,16 @@ class TTSDataset(Dataset):
         user_cur_msgs.append("请复述这段语音。")
         msgs.append({"role": "user", "content": "".join(user_cur_msgs)})
 
-        # 修正：正确的 special token 拼写，去掉多余的 ||
+        # 修正：正确的 special token 拼写，无多余竖线
         msgs.append({
             "role": "assistant",
             "content": f"<|tts_bos|>{item['text']}<|tts_eos|>"
         })
 
-        # 生成完整 prompt
         full_prompt = self.processor.tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=False
         )
 
-        # 生成 prefix prompt（不含 assistant，用于辅助定位 assistant 边界）
         prefix_msgs = msgs[:-1]
         prefix_prompt = self.processor.tokenizer.apply_chat_template(
             prefix_msgs, tokenize=False, add_generation_prompt=False
@@ -331,6 +342,7 @@ class TTSDataset(Dataset):
 
 
 # ==================== DataCollator（核心修正） ====================
+
 class TTSDataCollator:
     def __init__(self, processor: MiniCPMOProcessor, device: str, vq_codec: VQCodec, max_length: int = 512):
         self.processor = processor
@@ -340,12 +352,11 @@ class TTSDataCollator:
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
         prompts = [item["prompt"] for item in batch]
-        prefix_prompts = [item["prefix_prompt"] for item in batch]
         audios_list = [item["audios"] for item in batch]
         audio_parts_list = [item["audio_parts"] for item in batch]
         target_audios = [item["target_audio"] for item in batch]
+        audio_paths = [item["audio_path"] for item in batch]
 
-        # Processor 编码
         inputs = self.processor(
             prompts,
             [[] for _ in batch],
@@ -360,7 +371,7 @@ class TTSDataCollator:
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
 
-        # 正确的 special token ID
+        # 修正：正确的 special token ID
         tts_bos_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
         tts_eos_token_id = self.processor.tokenizer.convert_tokens_to_ids("<|tts_eos|>")
 
@@ -392,21 +403,21 @@ class TTSDataCollator:
 
         for b in range(input_ids.shape[0]):
             ids = input_ids[b].tolist()
-            
-            # mask <|tts_bos|> 及之前的所有内容（输入侧，不是生成目标）
+
+            # mask <|tts_bos|> 及之前的所有内容（纯输入，不是生成目标）
             try:
                 bos_pos = ids.index(tts_bos_token_id)
                 labels[b, :bos_pos + 1] = -100
             except ValueError:
                 labels[b, :] = -100
-            
-            # mask <|tts_eos|> 之后的所有内容（终止符之后无意义）
+
+            # mask <|tts_eos|> 之后的所有内容
             try:
                 eos_pos = ids.index(tts_eos_token_id)
                 labels[b, eos_pos + 1 :] = -100
             except ValueError:
                 pass
-            
+
             # mask padding
             labels[b, input_ids[b] == pad_token_id] = -100
 
@@ -423,9 +434,11 @@ class TTSDataCollator:
             "labels": labels.to(self.device),
             "tts_bounds": tts_bounds,
             "target_vq_tokens": target_vq_tokens,
+            "audio_paths": audio_paths,
         }
 
         return {k: v for k, v in model_inputs.items() if v is not None}
+
 
 # ==================== 冻结策略 ====================
 
@@ -483,9 +496,9 @@ def apply_freeze_strategy(model: MiniCPMO, cfg: TrainConfig):
     print(f"\n[Params] Trainable: {trainable:,} / Total: {total:,} ({100*trainable/total:.2f}%)")
 
 
-# ==================== TTS Loss ====================
+# ==================== TTS Loss（返回预测 tokens） ====================
 
-def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tensor) -> torch.Tensor:
+def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tensor) -> Tuple[torch.Tensor, List[Optional[np.ndarray]]]:
     device = llm_hidden_states.device
     tts = model.tts
     tts_bounds = batch["tts_bounds"]
@@ -493,10 +506,12 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
 
     losses = []
     valid_samples = 0
+    all_pred_tokens: List[Optional[np.ndarray]] = []
 
     for b in range(len(tts_bounds)):
         bos_idx, eos_idx = tts_bounds[b]
         if bos_idx < 0 or eos_idx <= bos_idx:
+            all_pred_tokens.append(None)
             continue
 
         sample_input_ids = batch["input_ids"][b]
@@ -505,6 +520,7 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
         llm_hidden = llm_hidden_states[b, bos_idx + 1 : eos_idx, :]
 
         if llm_tokens.numel() == 0 or llm_hidden.shape[0] == 0:
+            all_pred_tokens.append(None)
             continue
 
         llm_embeds = tts.emb_text(llm_tokens)
@@ -536,6 +552,7 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
 
         seq_len = target_tokens.shape[0]
         if seq_len == 0:
+            all_pred_tokens.append(None)
             continue
 
         audio_input = target_tokens[:-1, :].unsqueeze(0) if seq_len > 1 else torch.zeros(1, 0, tts.num_vq, device=device, dtype=torch.long)
@@ -557,6 +574,7 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
         audio_hidden = tts_outputs.last_hidden_state[:, condition.shape[1] - 1 :, :]
 
         loss_b = 0
+        pred_tokens_layers = []
         for q in range(tts.num_vq):
             logits_q = tts.head_code[q](audio_hidden)
             targets_q = target_tokens[:, q].unsqueeze(0)
@@ -565,14 +583,71 @@ def compute_tts_loss(model: MiniCPMO, batch: Dict, llm_hidden_states: torch.Tens
                 targets_q.reshape(-1),
                 ignore_index=-100,
             )
+            pred_q = logits_q.argmax(dim=-1).squeeze(0).cpu().numpy()
+            pred_tokens_layers.append(pred_q)
 
         losses.append(loss_b / tts.num_vq)
         valid_samples += 1
+        all_pred_tokens.append(pred_tokens_layers[0] if pred_tokens_layers else None)
 
     if not losses:
-        return torch.tensor(0.0, device=device)
+        return torch.tensor(0.0, device=device), all_pred_tokens
 
-    return torch.stack(losses).mean()
+    return torch.stack(losses).mean(), all_pred_tokens
+
+
+# ==================== Debug 信息收集器（只存不解码） ====================
+
+class DebugInfoCollector:
+    """训练时只收集解码所需信息，不执行解码，避免 CUDA 错误中断训练"""
+
+    def __init__(self, output_dir: str):
+        self.output_dir = os.path.join(output_dir, "debug_info")
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.logger = logging.getLogger("tts_train")
+        self.saved_steps = []
+
+    def save(
+        self,
+        pred_tokens: Optional[np.ndarray],
+        gt_tokens: np.ndarray,
+        audio_path: str,
+        step: int,
+        pred_text: str,
+        raw_text: str,
+    ) -> Optional[str]:
+        """保存解码所需的全部信息，返回保存目录"""
+        if pred_tokens is None:
+            self.logger.warning(f"[DebugInfo] step={step} pred_tokens is None, skip")
+            return None
+
+        step_dir = os.path.join(self.output_dir, f"step_{step}")
+        os.makedirs(step_dir, exist_ok=True)
+
+        np.save(os.path.join(step_dir, "pred_tokens.npy"), pred_tokens.astype(np.int64))
+        np.save(os.path.join(step_dir, "gt_tokens.npy"), gt_tokens.astype(np.int64))
+
+        meta = {
+            "step": step,
+            "audio_path": audio_path,
+            "pred_text": pred_text,
+            "raw_text": raw_text,
+            "pred_tokens_shape": list(pred_tokens.shape),
+            "pred_tokens_range": [int(pred_tokens.min()), int(pred_tokens.max())],
+            "gt_tokens_shape": list(gt_tokens.shape),
+            "gt_tokens_range": [int(gt_tokens.min()), int(gt_tokens.max())],
+        }
+        with open(os.path.join(step_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        self.saved_steps.append(step)
+        self.logger.info(f"[DebugInfo] Saved step {step} → {step_dir}")
+        return step_dir
+
+    def summary(self) -> str:
+        if not self.saved_steps:
+            return "No debug info collected"
+        return f"Collected {len(self.saved_steps)} steps: {self.saved_steps[:10]}{'...' if len(self.saved_steps) > 10 else ''}"
 
 
 # ==================== 训练循环 ====================
@@ -630,7 +705,11 @@ def train():
     model.config.stream_input = False
 
     if hasattr(model, "set_mode"):
-        mode_map = {"chat": ProcessorMode.CHAT, "streaming": ProcessorMode.STREAMING, "duplex": ProcessorMode.DUPLEX}
+        mode_map = {
+            "chat": ProcessorMode.CHAT,
+            "streaming": ProcessorMode.STREAMING,
+            "duplex": ProcessorMode.DUPLEX,
+        }
         model.set_mode(mode_map.get(cfg.mode, ProcessorMode.CHAT))
 
     # 加载 Processor
@@ -638,6 +717,18 @@ def train():
         cfg.model_name_or_path,
         trust_remote_code=cfg.trust_remote_code,
     )
+
+    # 验证 special token 存在性
+    bos_id = processor.tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+    eos_id = processor.tokenizer.convert_tokens_to_ids("<|tts_eos|>")
+    logger.info(f"Tokenizer check: <|tts_bos|>={bos_id}, <|tts_eos|>={eos_id}")
+    if bos_id == processor.tokenizer.unk_token_id or eos_id == processor.tokenizer.unk_token_id:
+        logger.error("CRITICAL: tts_bos 或 tts_eos 被映射为 unk_token，请检查 tokenizer 配置！")
+        raise RuntimeError("Special token 未正确注册")
+
+    # 获取 TTS 词汇表大小
+    num_audio_tokens = getattr(model.tts.config, "num_audio_tokens", None)
+    logger.info(f"TTS num_audio_tokens: {num_audio_tokens}")
 
     # 冻结策略
     apply_freeze_strategy(model, cfg)
@@ -670,6 +761,9 @@ def train():
     use_amp = (cfg.device == "cuda" and cfg.torch_dtype == "float16")
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
+    # Debug 收集器
+    collector = DebugInfoCollector(cfg.output_dir) if cfg.debug_mode else None
+
     # 训练循环
     model.train()
     global_step = 0
@@ -695,15 +789,22 @@ def train():
                 shift_logits = llm_logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous().long()
 
-                text_loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100,
-                )
+                # 防御：检查是否所有 labels 都是 -100
+                valid_labels = (shift_labels != -100).sum()
+                if valid_labels > 0:
+                    text_loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                else:
+                    text_loss = torch.tensor(0.0, device=device)
+                    logger.warning(f"[Step {global_step}] 所有 labels 均为 -100，text_loss 设为 0")
 
                 tts_loss = torch.tensor(0.0, device=device)
+                pred_tokens_list = []
                 if llm_hidden_states is not None and cfg.tts_loss_weight > 0:
-                    tts_loss = compute_tts_loss(model, batch, llm_hidden_states)
+                    tts_loss, pred_tokens_list = compute_tts_loss(model, batch, llm_hidden_states)
 
                 loss = text_loss * cfg.text_loss_weight + tts_loss * cfg.tts_loss_weight
                 loss = loss / cfg.gradient_accumulation_steps
@@ -714,8 +815,8 @@ def train():
             else:
                 loss.backward()
 
-            # Debug：只对比 assistant 部分的真值 vs 预测
-            if cfg.debug_mode and global_step % cfg.log_steps == 0:
+            # ========== Debug：只收集信息，不解码 ==========
+            if cfg.debug_mode and global_step % cfg.log_steps == 0 and collector is not None:
                 with torch.no_grad():
                     labels_sample = batch["labels"][0]
                     valid_mask = labels_sample != -100
@@ -725,11 +826,9 @@ def train():
                         start_idx = valid_positions[0].item()
                         end_idx = valid_positions[-1].item() + 1
 
-                        # 真值：labels 中 valid 的部分
                         raw_token_ids = labels_sample[start_idx:end_idx].cpu().tolist()
                         raw_text = processor.tokenizer.decode(raw_token_ids, skip_special_tokens=False)
 
-                        # 预测：logits 在 [start_idx-1:end_idx-1] 对应预测 labels[start_idx:end_idx]
                         pred_logits = llm_logits[0, start_idx - 1 : end_idx - 1, :]
                         pred_token_ids = pred_logits.argmax(dim=-1).cpu().tolist()
                         pred_text = processor.tokenizer.decode(pred_token_ids, skip_special_tokens=False)
@@ -746,9 +845,21 @@ def train():
                         logger.info(pred_text[:500])
                         logger.info("=" * 60)
 
-                        # 如果 TTS bounds 异常，告警
+                        # 只收集信息，不调用 vq_codec.decode
+                        if pred_tokens_list and pred_tokens_list[0] is not None:
+                            gt_tokens = batch["target_vq_tokens"][0]
+                            audio_path = batch["audio_paths"][0]
+                            collector.save(
+                                pred_tokens=pred_tokens_list[0],
+                                gt_tokens=gt_tokens,
+                                audio_path=audio_path,
+                                step=global_step,
+                                pred_text=pred_text[:500],
+                                raw_text=raw_text[:500],
+                            )
+
                         if bos_idx < 0 or eos_idx < 0:
-                            logger.warning(f"TTS bounds 异常: {tts_bounds}，请检查 special token")
+                            logger.warning(f"TTS bounds 异常: {tts_bounds}")
 
             # 记录
             raw_loss = loss.item() * cfg.gradient_accumulation_steps
@@ -795,7 +906,8 @@ def train():
                     total_text_loss = 0
                     total_tts_loss = 0
 
-                if global_step % cfg.save_steps == 0:
+                # 保存检查点（debug_mode 时不保存模型权重）
+                if not cfg.debug_mode and global_step % cfg.save_steps == 0:
                     save_path = os.path.join(cfg.output_dir, f"checkpoint-{global_step}")
                     os.makedirs(save_path, exist_ok=True)
                     model.save_pretrained(save_path)
@@ -808,12 +920,22 @@ def train():
         avg_epoch_tts = epoch_tts_loss / num_batches
         logger.info(f"[Epoch {epoch+1}/{cfg.num_epochs}] loss={avg_epoch_loss:.4f} text={avg_epoch_text:.4f} tts={avg_epoch_tts:.4f}")
 
-    # 最终保存
-    final_path = os.path.join(cfg.output_dir, "final")
-    os.makedirs(final_path, exist_ok=True)
-    model.save_pretrained(final_path)
-    processor.save_pretrained(final_path)
-    logger.info(f"[Done] 最终模型已保存: {final_path}")
+    # 最终保存（debug_mode 时也不保存）
+    if not cfg.debug_mode:
+        final_path = os.path.join(cfg.output_dir, "final")
+        os.makedirs(final_path, exist_ok=True)
+        model.save_pretrained(final_path)
+        processor.save_pretrained(final_path)
+        logger.info(f"[Done] 最终模型已保存: {final_path}")
+    else:
+        logger.info("[Done] Debug mode: 模型权重未保存")
+
+    if cfg.debug_mode and collector is not None:
+        logger.info(f"[DebugInfo] {collector.summary()}")
+        logger.info(
+            f"[DebugInfo] 训练结束后运行离线解码:\n"
+            f"  python offline_decode_batch.py --debug_dir {collector.output_dir} --model_dir {cfg.model_name_or_path}"
+        )
 
 
 import multiprocessing
