@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MiniCPM-O-4.5 推理调试脚本 (infer_debug.py) —— v11 修复版
+MiniCPM-O-4.5 推理调试脚本 (infer_debug.py) —— v12 修复版
 修复:
-  - 修复 "Boolean value of tensor with more than one value is ambiguous"
-    （所有 tensor 相关的 or/and 改为显式判断）
+  - 兼容 VQCodec.decode() 无 add_silence_prefix 参数的情况
+  - 修复 install_hooks 错误引用外部 args 变量（NameError）
+  - 若 gt_vq_tokens 为 None，明确提示并跳过对比，不抛异常
   - 同时 hook tts.generate / interleaved_generate / generate_chunk
   - 强制 flush + 文件落盘日志
 """
@@ -71,7 +72,8 @@ def log_tensor(title: str, tensor):
 
 # ==================== Monkey-patch Hook ====================
 
-def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None, vq_codec=None, replace_with_gt=False):
+def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None,
+                  vq_codec=None, replace_with_gt=False, output_audio_path="output.wav"):
     """
     在 model.chat() 调用的关键内部函数上安装 hook。
     同时捕获 tts.generate / interleaved_generate / generate_chunk 的 token。
@@ -95,7 +97,6 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None, vq_co
         _orig_tts_generate = model.tts.generate
         def _hooked_tts_generate(*args, **kwargs):
             log_section("Hook: MiniCPMTTS.generate 入口")
-            # 修复：不用 or 处理 tensor，显式判断
             if "inputs_embeds" in kwargs:
                 emb = kwargs["inputs_embeds"]
             elif args:
@@ -177,50 +178,68 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None, vq_co
         # ========== VQ Pred vs GT 对比 ==========
         pred_tokens = getattr(model, '_last_pred_vq_tokens', None)
 
+        if gt_vq_tokens is None:
+            log_flush("\n[对比检查] gt_vq_tokens 为 None，跳过 VQ 对比（VQCodec 编码失败或未初始化）")
+            return result
+
+        if vq_codec is None:
+            log_flush("\n[对比检查] vq_codec 为 None，跳过 VQ 对比")
+            return result
+
         log_flush(f"\n[对比检查] pred_tokens 类型: {type(pred_tokens)}, gt_vq_tokens 类型: {type(gt_vq_tokens)}")
 
-        if gt_vq_tokens is not None and vq_codec is not None:
-            gt_list = list(gt_vq_tokens)
+        gt_list = list(gt_vq_tokens)
 
-            if pred_tokens is not None and pred_tokens.numel() > 0:
-                pred_list = pred_tokens.tolist()
-                log_flush(f"\n>>> VQ Token 对比: Pred({len(pred_list)}) vs GT({len(gt_list)})")
-                min_len = min(len(pred_list), len(gt_list))
-                if min_len > 0:
-                    matches = sum(1 for a, b in zip(pred_list[:min_len], gt_list[:min_len]) if a == b)
-                    log_flush(f"    前 {min_len} 个重合: {matches}/{min_len} ({100*matches/min_len:.1f}%)")
-                    log_flush(f"    长度差异: Pred - GT = {len(pred_list) - len(gt_list)}")
-                    diffs = [(i, p, g) for i, (p, g) in enumerate(zip(pred_list[:min_len], gt_list[:min_len])) if p != g]
-                    if diffs:
-                        log_flush(f"    差异示例 (前10处): {diffs[:10]}")
-                    else:
-                        log_flush(f"    前 {min_len} 个 token 完全一致")
-                log_flush(f"    Pred unique: {len(set(pred_list))} | GT unique: {len(set(gt_list))}")
-            else:
-                log_flush("    [警告] pred_tokens 为空或 None！TTS 生成 hook 未捕获到 token。")
-                log_flush("    可能原因: 模型走了 interleaved_generate 但 hook 未安装，或 generate_audio=False")
+        if pred_tokens is not None and pred_tokens.numel() > 0:
+            pred_list = pred_tokens.tolist()
+            log_flush(f"\n>>> VQ Token 对比: Pred({len(pred_list)}) vs GT({len(gt_list)})")
+            min_len = min(len(pred_list), len(gt_list))
+            if min_len > 0:
+                matches = sum(1 for a, b in zip(pred_list[:min_len], gt_list[:min_len]) if a == b)
+                log_flush(f"    前 {min_len} 个重合: {matches}/{min_len} ({100*matches/min_len:.1f}%)")
+                log_flush(f"    长度差异: Pred - GT = {len(pred_list) - len(gt_list)}")
+                diffs = [(i, p, g) for i, (p, g) in enumerate(zip(pred_list[:min_len], gt_list[:min_len])) if p != g]
+                if diffs:
+                    log_flush(f"    差异示例 (前10处): {diffs[:10]}")
+                else:
+                    log_flush(f"    前 {min_len} 个 token 完全一致")
+            log_flush(f"    Pred unique: {len(set(pred_list))} | GT unique: {len(set(gt_list))}")
+        else:
+            log_flush("    [警告] pred_tokens 为空或 None！TTS 生成 hook 未捕获到 token。")
+            log_flush("    可能原因: 模型走了 interleaved_generate 但 hook 未安装，或 generate_audio=False")
 
-            # GT 解码
+        # GT 解码（兼容无 add_silence_prefix 的 VQCodec）
+        try:
+            log_section("GT VQ Tokens 解码")
             try:
-                log_section("GT VQ Tokens 解码")
                 gt_waveform = vq_codec.decode(
                     gt_vq_tokens,
                     prompt_wav_path=gt_audio_path,
                     add_silence_prefix=True,
                 )
-                log_flush(f"    GT 解码音频: {len(gt_waveform)} samples ({len(gt_waveform)/24000:.2f}s @ 24kHz)")
+            except TypeError as te:
+                if "add_silence_prefix" in str(te):
+                    log_flush("    [兼容] VQCodec.decode 不支持 add_silence_prefix，重新调用...")
+                    gt_waveform = vq_codec.decode(
+                        gt_vq_tokens,
+                        prompt_wav_path=gt_audio_path,
+                    )
+                else:
+                    raise
 
-                gt_out_path = os.path.join(os.path.dirname(args.output_audio), "output_gt.wav") if hasattr(args, 'output_audio') else "output_gt.wav"
-                sf.write(gt_out_path, gt_waveform, 24000)
-                log_flush(f"    [保存] GT 音频 -> {gt_out_path}")
+            log_flush(f"    GT 解码音频: {len(gt_waveform)} samples ({len(gt_waveform)/24000:.2f}s @ 24kHz)")
 
-                if replace_with_gt:
-                    log_flush("    [替换] 返回 GT 音频替代 Pred 音频")
-                    result = gt_waveform
-            except Exception as e:
-                log_flush(f"    [错误] GT 解码失败: {e}")
-                import traceback
-                traceback.print_exc()
+            gt_out_path = os.path.join(os.path.dirname(output_audio_path), "output_gt.wav") if output_audio_path else "output_gt.wav"
+            sf.write(gt_out_path, gt_waveform, 24000)
+            log_flush(f"    [保存] GT 音频 -> {gt_out_path}")
+
+            if replace_with_gt:
+                log_flush("    [替换] 返回 GT 音频替代 Pred 音频")
+                result = gt_waveform
+        except Exception as e:
+            log_flush(f"    [错误] GT 解码失败: {e}")
+            import traceback
+            traceback.print_exc()
 
         return result
 
@@ -233,7 +252,6 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None, vq_co
         if hasattr(tokenizer_obj, 'stream'):
             _orig_t2w_stream = tokenizer_obj.stream
             def _hooked_t2w_stream(*args, **kwargs):
-                # 修复：不用 or 处理 tensor
                 if args:
                     token_ids = args[0]
                 elif 'token_ids' in kwargs:
@@ -479,6 +497,8 @@ def main():
         log_flush(f"[VQCodec] 临时参考音频: {gt_audio_path}")
     except Exception as e:
         log_flush(f"[警告] VQCodec 初始化/编码失败: {e}")
+        import traceback
+        traceback.print_exc()
 
     install_hooks(
         model,
@@ -487,6 +507,7 @@ def main():
         gt_audio_path=gt_audio_path,
         vq_codec=vq_codec,
         replace_with_gt=args.replace_with_gt,
+        output_audio_path=args.output_audio,
     )
 
     user_content = [audio_input]
