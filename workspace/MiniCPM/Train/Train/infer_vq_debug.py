@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MiniCPM-O-4.5 推理调试脚本 (infer_debug.py) —— v12 修复版
-修复:
-  - 兼容 VQCodec.decode() 无 add_silence_prefix 参数的情况
-  - 修复 install_hooks 错误引用外部 args 变量（NameError）
-  - 若 gt_vq_tokens 为 None，明确提示并跳过对比，不抛异常
-  - 同时 hook tts.generate / interleaved_generate / generate_chunk
-  - 强制 flush + 文件落盘日志
+MiniCPM-O-4.5 推理调试脚本 (infer_debug.py) —— v13
+核心改动：
+  - model.chat() 返回的音频不再走模型内置 Token2Wav，而是提取 Pred VQ tokens
+    交给用户 VQCodec 解码，生成 output.wav
+  - 同时保留模型原始解码音频为 output_orig.wav（用于对比）
+  - GT 编码解码生成 output_gt.wav（闭环验证）
 """
 
 import argparse
@@ -76,9 +75,8 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None,
                   vq_codec=None, replace_with_gt=False, output_audio_path="output.wav"):
     """
     在 model.chat() 调用的关键内部函数上安装 hook。
-    同时捕获 tts.generate / interleaved_generate / generate_chunk 的 token。
+    核心：_generate_speech_non_streaming 出口用 VQCodec 解码 Pred tokens，替换模型原始音频。
     """
-    device = model.device
 
     # ---- 通用：保存 TTS 生成的 token ----
     def _save_pred_tokens(new_ids):
@@ -111,7 +109,7 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None,
             return result
         model.tts.generate = _hooked_tts_generate
 
-        # Hook: tts.interleaved_generate (interleaved 模式)
+        # Hook: tts.interleaved_generate
         if hasattr(model.tts, 'interleaved_generate'):
             _orig_interleaved = model.tts.interleaved_generate
             def _hooked_interleaved(*args, **kwargs):
@@ -123,7 +121,7 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None,
                 return result
             model.tts.interleaved_generate = _hooked_interleaved
 
-        # Hook: tts.generate_chunk (streaming chunk)
+        # Hook: tts.generate_chunk
         if hasattr(model.tts, 'generate_chunk'):
             _orig_chunk = model.tts.generate_chunk
             def _hooked_chunk(*args, **kwargs):
@@ -159,93 +157,110 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None,
         log_tensor("last_hidden_states (堆叠后)", last_hidden_states)
         log_flush(f"    full_sequences len = {full_seq_len}")
 
-        # 调用原函数
-        result = _orig_generate_speech(
+        # 1. 先调用原函数，得到模型原始解码音频（用于对比）
+        result_orig = _orig_generate_speech(
             outputs=outputs, tts_bound=tts_bound, tts_proj_layer=tts_proj_layer,
             audio_prompt=audio_prompt, output_tts_inputs_embeds_path=output_tts_inputs_embeds_path,
             tts_sampling_params=tts_sampling_params,
         )
 
         log_section("Hook: _generate_speech_non_streaming 出口")
-        pred_waveform = result
-        if isinstance(pred_waveform, np.ndarray):
-            log_flush(f">>> Pred 返回波形: {len(pred_waveform)} samples, {len(pred_waveform)/24000:.2f}s @ 24kHz")
-        elif isinstance(pred_waveform, torch.Tensor):
-            log_flush(f">>> Pred 返回波形 tensor: {tuple(pred_waveform.shape)}")
+        if isinstance(result_orig, np.ndarray):
+            log_flush(f">>> 模型原始波形: {len(result_orig)} samples, {len(result_orig)/24000:.2f}s @ 24kHz")
+        elif isinstance(result_orig, torch.Tensor):
+            log_flush(f">>> 模型原始波形 tensor: {tuple(result_orig.shape)}")
         else:
-            log_flush(f">>> Pred 返回类型: {type(pred_waveform)}")
+            log_flush(f">>> 模型原始返回类型: {type(result_orig)}")
 
-        # ========== VQ Pred vs GT 对比 ==========
+        # 2. 保存模型原始解码音频（对比用）
+        orig_path = os.path.join(os.path.dirname(output_audio_path), "output_orig.wav") if output_audio_path else "output_orig.wav"
+        if isinstance(result_orig, np.ndarray):
+            sf.write(orig_path, result_orig, 24000)
+            log_flush(f"    [保存] 模型原始音频 -> {orig_path}")
+
+        # 3. 提取 Pred tokens
         pred_tokens = getattr(model, '_last_pred_vq_tokens', None)
-
-        if gt_vq_tokens is None:
-            log_flush("\n[对比检查] gt_vq_tokens 为 None，跳过 VQ 对比（VQCodec 编码失败或未初始化）")
-            return result
-
-        if vq_codec is None:
-            log_flush("\n[对比检查] vq_codec 为 None，跳过 VQ 对比")
-            return result
-
         log_flush(f"\n[对比检查] pred_tokens 类型: {type(pred_tokens)}, gt_vq_tokens 类型: {type(gt_vq_tokens)}")
 
-        gt_list = list(gt_vq_tokens)
-
-        if pred_tokens is not None and pred_tokens.numel() > 0:
-            pred_list = pred_tokens.tolist()
-            log_flush(f"\n>>> VQ Token 对比: Pred({len(pred_list)}) vs GT({len(gt_list)})")
-            min_len = min(len(pred_list), len(gt_list))
-            if min_len > 0:
-                matches = sum(1 for a, b in zip(pred_list[:min_len], gt_list[:min_len]) if a == b)
-                log_flush(f"    前 {min_len} 个重合: {matches}/{min_len} ({100*matches/min_len:.1f}%)")
-                log_flush(f"    长度差异: Pred - GT = {len(pred_list) - len(gt_list)}")
-                diffs = [(i, p, g) for i, (p, g) in enumerate(zip(pred_list[:min_len], gt_list[:min_len])) if p != g]
-                if diffs:
-                    log_flush(f"    差异示例 (前10处): {diffs[:10]}")
-                else:
-                    log_flush(f"    前 {min_len} 个 token 完全一致")
-            log_flush(f"    Pred unique: {len(set(pred_list))} | GT unique: {len(set(gt_list))}")
-        else:
-            log_flush("    [警告] pred_tokens 为空或 None！TTS 生成 hook 未捕获到 token。")
-            log_flush("    可能原因: 模型走了 interleaved_generate 但 hook 未安装，或 generate_audio=False")
-
-        # GT 解码（兼容无 add_silence_prefix 的 VQCodec）
-        try:
-            log_section("GT VQ Tokens 解码")
+        # 4. 用 VQCodec 解码 Pred tokens -> 替换 result
+        result_vqcodec = None
+        if vq_codec is not None and pred_tokens is not None and pred_tokens.numel() > 0:
             try:
-                gt_waveform = vq_codec.decode(
-                    gt_vq_tokens,
-                    prompt_wav_path=gt_audio_path,
-                    add_silence_prefix=True,
-                )
-            except TypeError as te:
-                if "add_silence_prefix" in str(te):
-                    log_flush("    [兼容] VQCodec.decode 不支持 add_silence_prefix，重新调用...")
+                log_section("VQCodec 解码 Pred tokens")
+                pred_list = pred_tokens.cpu().numpy()  # VQCodec 接受 np.ndarray / list / tensor
+                log_flush(f"    Pred tokens 长度: {len(pred_list)}, range [{int(pred_list.min())}, {int(pred_list.max())}]")
+
+                # 兼容 VQCodec 是否支持 add_silence_prefix
+                try:
+                    result_vqcodec = vq_codec.decode(
+                        pred_list,
+                        prompt_wav_path=gt_audio_path,
+                        add_silence_prefix=True,
+                    )
+                except TypeError as te:
+                    if "add_silence_prefix" in str(te):
+                        log_flush("    [兼容] VQCodec.decode 不支持 add_silence_prefix，重新调用...")
+                        result_vqcodec = vq_codec.decode(
+                            pred_list,
+                            prompt_wav_path=gt_audio_path,
+                        )
+                    else:
+                        raise
+
+                log_flush(f"    VQCodec 解码音频: {len(result_vqcodec)} samples ({len(result_vqcodec)/24000:.2f}s @ 24kHz)")
+
+                # 保存 VQCodec 解码的 Pred 音频
+                vq_pred_path = os.path.join(os.path.dirname(output_audio_path), "output_vq_pred.wav") if output_audio_path else "output_vq_pred.wav"
+                sf.write(vq_pred_path, result_vqcodec, 24000)
+                log_flush(f"    [保存] VQCodec Pred 音频 -> {vq_pred_path}")
+
+            except Exception as e:
+                log_flush(f"    [错误] VQCodec 解码 Pred tokens 失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # 5. 用 VQCodec 解码 GT tokens（闭环验证）
+        if vq_codec is not None and gt_vq_tokens is not None:
+            try:
+                log_section("VQCodec 解码 GT tokens")
+                try:
                     gt_waveform = vq_codec.decode(
                         gt_vq_tokens,
                         prompt_wav_path=gt_audio_path,
+                        add_silence_prefix=True,
                     )
-                else:
-                    raise
+                except TypeError as te:
+                    if "add_silence_prefix" in str(te):
+                        gt_waveform = vq_codec.decode(
+                            gt_vq_tokens,
+                            prompt_wav_path=gt_audio_path,
+                        )
+                    else:
+                        raise
 
-            log_flush(f"    GT 解码音频: {len(gt_waveform)} samples ({len(gt_waveform)/24000:.2f}s @ 24kHz)")
+                log_flush(f"    GT 解码音频: {len(gt_waveform)} samples ({len(gt_waveform)/24000:.2f}s @ 24kHz)")
 
-            gt_out_path = os.path.join(os.path.dirname(output_audio_path), "output_gt.wav") if output_audio_path else "output_gt.wav"
-            sf.write(gt_out_path, gt_waveform, 24000)
-            log_flush(f"    [保存] GT 音频 -> {gt_out_path}")
+                gt_out_path = os.path.join(os.path.dirname(output_audio_path), "output_gt.wav") if output_audio_path else "output_gt.wav"
+                sf.write(gt_out_path, gt_waveform, 24000)
+                log_flush(f"    [保存] GT 音频 -> {gt_out_path}")
 
-            if replace_with_gt:
-                log_flush("    [替换] 返回 GT 音频替代 Pred 音频")
-                result = gt_waveform
-        except Exception as e:
-            log_flush(f"    [错误] GT 解码失败: {e}")
-            import traceback
-            traceback.print_exc()
+            except Exception as e:
+                log_flush(f"    [错误] GT 解码失败: {e}")
+                import traceback
+                traceback.print_exc()
 
-        return result
+        # 6. 决定返回哪个音频
+        # 优先级：VQCodec Pred > 模型原始 > None
+        if result_vqcodec is not None:
+            log_flush("\n[返回] 使用 VQCodec 解码的 Pred 音频作为 model.chat() 返回值")
+            return result_vqcodec
+        else:
+            log_flush("\n[返回] 使用模型原始解码音频（VQCodec 解码失败 fallback）")
+            return result_orig
 
     model._generate_speech_non_streaming = _hooked_generate_speech
 
-    # ---- Hook: Token2wav.stream ----
+    # ---- Hook: Token2wav.stream（仅打印，不替换） ----
     if (hasattr(model, 'tts') and model.tts is not None and
             hasattr(model.tts, 'audio_tokenizer') and model.tts.audio_tokenizer is not None):
         tokenizer_obj = model.tts.audio_tokenizer
@@ -262,21 +277,19 @@ def install_hooks(model, tokenizer, gt_vq_tokens=None, gt_audio_path=None,
                     token_ids = None
 
                 last_chunk = kwargs.get('last_chunk', False)
-                return_waveform = kwargs.get('return_waveform', True)
-
                 _tid = token_ids if hasattr(token_ids, '__len__') else []
                 log_flush(f"\n[Token2Wav.stream] len={len(_tid)}, last_chunk={last_chunk}")
                 if len(_tid) > 0:
                     log_flush(f"    token_ids[:20]: {list(_tid)[:20]}")
                     log_flush(f"    token_ids[-20:]: {list(_tid)[-20:]}")
                 result = _orig_t2w_stream(*args, **kwargs)
-                if result is not None and return_waveform:
+                if result is not None:
                     wav = result.squeeze() if hasattr(result, 'squeeze') else result
                     log_flush(f"    -> 输出波形: {len(wav)} samples")
                 return result
             tokenizer_obj.stream = _hooked_t2w_stream
 
-    log_flush("[Hook] 安装完成: generate / interleaved_generate / generate_chunk / _generate_speech_non_streaming / Token2Wav.stream")
+    log_flush("[Hook] 安装完成。输出音频优先级: VQCodec Pred > 模型原始")
 
 
 # ==================== 独立分析：输入 Token 结构 ====================
@@ -433,8 +446,6 @@ def parse_args():
     parser.add_argument("--tts-temperature", type=float, default=0.8)
     parser.add_argument("--tts-top-p", type=float, default=0.85)
     parser.add_argument("--tts-top-k", type=int, default=25)
-    parser.add_argument("--replace-with-gt", action="store_true",
-                        help="将最终输出音频替换为 GT VQ tokens 解码音频")
     return parser.parse_args()
 
 
@@ -506,7 +517,6 @@ def main():
         gt_vq_tokens=gt_vq_tokens,
         gt_audio_path=gt_audio_path,
         vq_codec=vq_codec,
-        replace_with_gt=args.replace_with_gt,
         output_audio_path=args.output_audio,
     )
 
