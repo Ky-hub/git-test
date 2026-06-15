@@ -3,42 +3,20 @@
 """
 run_evaluation_local.py
 
-MiniCPM-o-4.5 本地模型评估脚本
-==============================
-
-直接加载 MiniCPMO 模型进行推理（参考 infer_debug.py 模式），
-绕过 Gateway/Worker 网络服务，完全避免 403/连接问题。
-
-适用场景：
-- 评估服务器有 GPU，可直接加载模型
-- 内网 Gateway/Worker 有连接问题
-- 需要稳定的批量评估
-
-要求：
-- 与 MiniCPMO45 代码同目录（或设置 PYTHONPATH）
-- GPU 显存足够加载模型
-
-启动方式（与 infer_debug.py 一致）：
-    cd /path/to/Train
-    PYTHONPATH=. python adapters/run_evaluation_local.py \
-        --model-path /path/to/base_model \
-        --data-dir /path/to/fdb_v3_data_released \
-        --output-dir ./eval_results
+MiniCPM-o-4.5 本地模型评估脚本（全双工流式版本）
 """
 
 import os
 import sys
 import json
 import time
-import base64
 import logging
 import argparse
-import tempfile
 import datetime
 import statistics
+import tempfile
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
-from collections import defaultdict
+from typing import Optional, Dict, Any
 
 import numpy as np
 import librosa
@@ -53,11 +31,8 @@ logger = logging.getLogger("eval_local")
 # ── Config ──────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_JSON_PATH = PROJECT_ROOT / "benchmark_data_v2.json"
-
-# 数据目录：fdb_v3_data_released 默认与 benchmark_data_v2.json 同级
 DEFAULT_DATA_DIR = PROJECT_ROOT / "fdb_v3_data_released"
 
-# 内部 LLM 裁判
 INTERNAL_LLM_URL = os.environ.get("INTERNAL_LLM_URL", "")
 INTERNAL_LLM_MODEL = os.environ.get("INTERNAL_LLM_MODEL", "qwen2.5-72b")
 
@@ -67,7 +42,6 @@ INTERNAL_LLM_MODEL = os.environ.get("INTERNAL_LLM_MODEL", "qwen2.5-72b")
 # =============================================================================
 
 def load_benchmark_data(data_json_path: str):
-    """加载 benchmark_data_v2.json"""
     if not os.path.exists(data_json_path):
         logger.warning(f"Data JSON not found: {data_json_path}")
         return {}
@@ -79,14 +53,12 @@ def load_benchmark_data(data_json_path: str):
 
 
 def discover_inputs(root_dir: str):
-    """发现所有 input.wav / input.mp4 文件"""
     root = Path(root_dir)
     inputs = []
     if not root.exists():
         return inputs
 
     def pick_input(ex_dir: Path):
-        """优先选 input.mp4（音视频），其次 input.wav（纯音频）"""
         mp4 = ex_dir / "input.mp4"
         if mp4.exists():
             return str(mp4)
@@ -95,7 +67,6 @@ def discover_inputs(root_dir: str):
             return str(wav)
         return None
 
-    # 嵌套: {pid}/example_{id}/input.{wav,mp4}
     for pid_dir in sorted(root.iterdir()):
         if not pid_dir.is_dir() or pid_dir.name.startswith("."):
             continue
@@ -108,7 +79,6 @@ def discover_inputs(root_dir: str):
             if inp:
                 inputs.append((pid, eid, inp))
 
-    # 扁平: {id}_{pid}/input.{wav,mp4}
     if not inputs:
         import re
         pat = re.compile(r"^(.+)_([0-9a-f]{24})$")
@@ -162,7 +132,6 @@ class LLMJudge:
             if not content:
                 logger.warning(f"Judge returned empty content. Raw: {raw_json}")
                 return self._fallback(response)
-            logger.debug(f"Judge raw response: {content[:200]}")
             return self._parse(content)
         except Exception as e:
             logger.warning(f"Judge failed: {e}")
@@ -187,7 +156,7 @@ class LLMJudge:
     @staticmethod
     def _s(line: str) -> int:
         try:
-            parts = line.split(":", 1)  # 只分割第一个冒号
+            parts = line.split(":", 1)
             if len(parts) < 2:
                 return 3
             val = parts[1].strip()
@@ -208,29 +177,18 @@ class LLMJudge:
 
 
 # =============================================================================
-# 模型推理（核心，参考 infer_debug.py）
+# 模型推理（全双工流式）
 # =============================================================================
 
 def _import_minicpmo45():
-    """
-    兼容多种 MiniCPMO45 目录位置的导入方式
-    
-    尝试顺序：
-    1. PYTHONPATH 中的 MiniCPMO45
-    2. 与当前脚本同级目录下的 MiniCPMO45
-    3. 项目根目录下的 MiniCPMO45
-    """
     import importlib.util
-
-    # 尝试直接导入（PYTHONPATH 已设置时）
     try:
-        from MiniCPMO45.modeling_minicpmo_unified import MiniCPMO
+        from MiniCPMO45.modeling_minicpmo_unified import MiniCPMO, ProcessorMode
         from MiniCPMO45.utils import TTSSamplingParams
-        return MiniCPMO, TTSSamplingParams
+        return MiniCPMO, TTSSamplingParams, ProcessorMode
     except ImportError:
         pass
 
-    # 尝试从脚本所在目录的父目录导入
     script_dir = Path(__file__).resolve().parent
     for base in [script_dir, script_dir.parent]:
         init_file = base / "MiniCPMO45" / "__init__.py"
@@ -243,49 +201,37 @@ def _import_minicpmo45():
             mod = importlib.util.module_from_spec(spec)
             sys.modules["MiniCPMO45"] = mod
             spec.loader.exec_module(mod)
-            # 再导入子模块
             model_module = importlib.import_module("MiniCPMO45.modeling_minicpmo_unified")
             utils_module = importlib.import_module("MiniCPMO45.utils")
-            return model_module.MiniCPMO, utils_module.TTSSamplingParams
+            return model_module.MiniCPMO, utils_module.TTSSamplingParams, model_module.ProcessorMode
 
-    # 都失败了，给出清晰的错误提示
     raise ImportError(
-        "无法导入 MiniCPMO45。请确保以下任一条件满足：\n"
-        "1. 设置 PYTHONPATH 包含 MiniCPMO45 的父目录：\n"
-        "   export PYTHONPATH=/path/to/Train:$PYTHONPATH\n"
-        "2. 将 MiniCPMO45 目录放在以下位置之一：\n"
-        f"   - {script_dir}/MiniCPMO45/\n"
-        f"   - {script_dir.parent}/MiniCPMO45/\n"
-        "3. 或者直接 cd 到 Train 目录运行：\n"
-        "   cd /path/to/Train && PYTHONPATH=. python adapters/run_evaluation_local.py ..."
+        "无法导入 MiniCPMO45。请确保 PYTHONPATH 包含 MiniCPMO45 的父目录，"
+        "或将 MiniCPMO45 放在脚本同级目录下。"
     )
 
 
 class MiniCPMOLocalInference:
-    """
-    本地模型推理封装
-    
-    与 infer_debug.py 的半双工模式一致：
-      model.chat(msgs, generate_audio=True, use_tts_template=True, ...)
-    """
-
     def __init__(
         self,
         model_path: str,
         device: str = "cuda",
         dtype: str = "bfloat16",
         max_new_tokens: int = 512,
+        max_speak_tokens: int = 50,
+        chunk_ms: int = 1000,
+        realtime: bool = False,
     ):
         import torch
 
-        MiniCPMO, TTSSamplingParams = _import_minicpmo45()
-
+        MiniCPMO, TTSSamplingParams, ProcessorMode = _import_minicpmo45()
         self.max_new_tokens = max_new_tokens
-        self.tts_params = TTSSamplingParams(temperature=0.8, top_p=0.85, top_k=25)
+        self.max_speak_tokens = max_speak_tokens
+        self.chunk_ms = chunk_ms
+        self.realtime = realtime
+        self.ProcessorMode = ProcessorMode
 
         logger.info(f"Loading model from {model_path}...")
-
-        # 加载模型
         torch_dtype = getattr(torch, dtype)
         self.model = MiniCPMO.from_pretrained(
             model_path,
@@ -295,20 +241,24 @@ class MiniCPMOLocalInference:
         )
         self.model.eval()
 
-        # 初始化 Token2Wav（streaming 模式，与 infer_debug.py 一致）
-        # 注意：不调用 init_unified()，避免 DuplexCapability 修改模型状态
-        self.model.init_token2wav(streaming=True)
-
-        # processor 是延迟初始化的（第一次 chat() 时才创建）
-        # 这里先不获取 tokenizer，需要时通过 property 延迟加载
+        # 将 chunk_ms 传入 duplex_config，让 DuplexCapability 内部使用
+        self.model.init_unified(
+            pt_path=None,
+            chat_vocoder="token2wav",
+            preload_both_tts=False,
+            duplex_config={
+                "max_new_speak_tokens_per_chunk": self.max_speak_tokens,
+                "chunk_ms": self.chunk_ms,
+                "first_chunk_ms": self.chunk_ms + 35,  # 与源码对齐，first_chunk 略长
+            },
+            device=device,
+        )
         self._tokenizer = None
-        logger.info("Model loaded successfully")
+        logger.info(f"Model loaded (chunk_ms={chunk_ms}, realtime={realtime})")
 
     @property
     def tokenizer(self):
-        """延迟获取 tokenizer（在第一次 chat() 后 processor 才被创建）"""
         if self._tokenizer is None:
-            # 触发 processor 初始化
             if not hasattr(self.model, 'processor') or self.model.processor is None:
                 from MiniCPMO45.processing_minicpmo import MiniCPMOProcessor
                 self.model.processor = MiniCPMOProcessor.from_pretrained(
@@ -322,84 +272,258 @@ class MiniCPMOLocalInference:
         audio_path: str,
         video_path: Optional[str] = None,
         system_prompt: str = "You are a helpful assistant.",
+        ref_audio_path: Optional[str] = None,
     ):
         """
-        对单个样本进行推理（支持纯音频或音视频）
-        与 infer_debug.py 一致：使用 model.chat() 非流式半双工模式
-
-        Args:
-            audio_path: 输入音频路径（用于 TTS 参考音色）
-            video_path: 输入视频路径（可选）
-            system_prompt: 系统提示词
-
-        Returns:
-            dict: {
-                "text": str,               # 回复文本
-                "waveform": np.array|None, # 输出音频波形
-                "latency_ms": float,       # 总延迟
-                "audio_duration_ms": float,# 输入音频时长
-            }
+        全双工流式推理。
+        输入音频完整 chunk-by-chunk，不截断。
+        若 realtime=True，每处理完一个 chunk 会 sleep 到与真实时间对齐。
         """
         import torch
 
-        # 加载音频
+        # ── 1. 加载输入音频（完整，不截断） ──
         audio_input, sr = librosa.load(audio_path, sr=16000, mono=True)
         audio_duration_ms = len(audio_input) / sr * 1000
+        logger.info(f"[Input] Loaded {len(audio_input)} samples ({audio_duration_ms/1000:.1f}s) — NOT truncated")
 
-        # 构建消息（与源码 chat() 对齐）
-        if video_path and os.path.exists(video_path):
-            user_content = [video_path, audio_input]
-            logger.debug(f"Video+Audio mode: {video_path}")
+        # ── 2. 准备参考音色（TTS voice clone） ──
+        if ref_audio_path and os.path.exists(ref_audio_path):
+            ref_audio, _ = librosa.load(ref_audio_path, sr=16000, mono=True)
+            logger.info(f"[Ref] Using specified ref audio: {ref_audio_path}")
         else:
-            user_content = [audio_input]
+            ref_audio = audio_input.copy()
+            logger.info("[Ref] No ref audio specified, using input audio as default")
 
-        msgs = [
-            {"role": "system", "content": [system_prompt]},
-            {"role": "user", "content": user_content},
-        ]
-
-        # 截断参考音频避免 Token2Wav cache 溢出
-        # Token2Wav 的 set_stream_cache 对长音频可能溢出
-        max_ref_sec = 10  # 最多取 10 秒作为参考音色
+        # 截断参考音色到 10s，避免 Token2Wav cache 溢出
+        max_ref_sec = 10
         max_ref_samples = max_ref_sec * sr
-        if len(audio_input) > max_ref_samples:
-            tts_ref = audio_input[:max_ref_samples]
-            logger.debug(f"Truncated ref audio: {len(audio_input)} -> {max_ref_samples} samples ({max_ref_sec}s)")
-        else:
-            tts_ref = audio_input
+        if len(ref_audio) > max_ref_samples:
+            ref_audio = ref_audio[:max_ref_samples]
+            logger.info(f"[Ref] Truncated to {max_ref_sec}s ({max_ref_samples} samples)")
 
-        # 推理（非流式）
-        start = time.perf_counter()
+        # 将截断后的参考音色写入临时文件，供 Token2Wav set_stream_cache
+        tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(tmp_wav.name, ref_audio, samplerate=sr)
+        prompt_wav_path = tmp_wav.name
+        tmp_wav.close()
 
-        result = self.model.chat(
-            msgs=msgs,
-            generate_audio=True,
-            use_tts_template=True,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=True,
-            tts_ref_audio=tts_ref,
-            tts_sampling_params=self.tts_params,
+        # ── 3. 设置全双工模式 ──
+        self.model.set_mode(self.ProcessorMode.DUPLEX)
+
+        # ── 关键修正：prefix/suffix 严格与 infer_debug.py 一致 ──
+        # 错误示范（之前）：prefix = f"||<<||<|im_start|>system..."  ← 多了 ||<< 导致 tokenizer 无法识别特殊 token
+        # 正确格式（如下）：纯字符串，让 tokenizer 正确识别 <|im_start|> 等特殊 token
+        prefix = f"||<|im_start|>system\n{system_prompt}\n<<||<|audio_start|>"
+        suffix = "||<|audio_end|>"
+
+        full_prompt = self.model.duplex_prepare(
+            prefix_system_prompt=prefix,
+            suffix_system_prompt=suffix,
+            ref_audio=ref_audio,
+            prompt_wav_path=prompt_wav_path,
+        )
+        logger.info(f"[Duplex] System prompt prepared")
+
+        # ── 4. 对完整输入音频进行 chunk-by-chunk 处理 ──
+        chunk_size = int(self.chunk_ms * sr / 1000)  # 根据 chunk_ms 动态计算
+        total_len = len(audio_input)
+        num_real_chunks = (total_len + chunk_size - 1) // chunk_size
+        logger.info(f"[Duplex] Processing {num_real_chunks} chunks ({self.chunk_ms}ms/chunk) from {audio_duration_ms/1000:.1f}s audio")
+
+        unit_records = []
+        all_speak_texts = []
+        all_audio_chunks = []
+
+        # 计时
+        infer_start = time.perf_counter()
+        first_speak_time_ms = None
+
+        # 处理所有真实音频 chunk
+        for i in range(num_real_chunks):
+            chunk_start = i * chunk_size
+            chunk_end = min((i + 1) * chunk_size, total_len)
+            chunk = audio_input[chunk_start:chunk_end]
+            if len(chunk) < chunk_size:
+                chunk = np.pad(chunk, (0, chunk_size - len(chunk)), mode="constant")
+
+            # 处理 chunk（内部会计时）
+            gen_res = self._process_chunk(
+                i, chunk, chunk_start, chunk_end,
+                unit_records, all_speak_texts, all_audio_chunks,
+                is_silence=False,
+            )
+
+            # 记录首次 SPEAK
+            if first_speak_time_ms is None and not gen_res['is_listen']:
+                first_speak_time_ms = (time.perf_counter() - infer_start) * 1000
+                logger.info(f"\n*** FIRST SPEAK at chunk {i}: {first_speak_time_ms:.0f}ms from audio start ***")
+
+            # ── 实时模拟：如果处理太快，sleep 到与真实时间对齐 ──
+            if self.realtime and i < num_real_chunks - 1:  # 最后一个 chunk 不需要等
+                expected_time = (i + 1) * self.chunk_ms / 1000.0  # 当前应该消耗的真实时间
+                elapsed = time.perf_counter() - infer_start
+                if elapsed < expected_time:
+                    sleep_time = expected_time - elapsed
+                    logger.info(f"[Realtime] Sleep {sleep_time:.3f}s to align with chunk {i+1}")
+                    time.sleep(sleep_time)
+
+            if gen_res['end_of_turn']:
+                logger.info(f"[Duplex] Turn ended at real chunk {i}")
+                break
+
+        # ── 5. 静音推进 ──
+        last_chunk_was_speak = (
+            unit_records and not unit_records[-1]['is_listen']
+            and not unit_records[-1]['end_of_turn']
         )
 
-        elapsed_ms = (time.perf_counter() - start) * 1000
+        if last_chunk_was_speak:
+            max_silence_chunks = 10
+            silence_chunk = np.zeros(chunk_size, dtype=np.float32)
+            logger.info(f"\n[Duplex] Audio ended but model still SPEAK — silence push mode (max {max_silence_chunks})")
 
-        # 解析结果：chat() 返回 (text, waveform) 或 text
-        if isinstance(result, tuple):
-            text, waveform = result
+            silence_idx = 0
+            while last_chunk_was_speak and silence_idx < max_silence_chunks:
+                silence_idx += 1
+                gen_res = self._process_chunk(
+                    num_real_chunks + silence_idx - 1,
+                    silence_chunk, 0, 0,
+                    unit_records, all_speak_texts, all_audio_chunks,
+                    is_silence=True,
+                )
+
+                if self.realtime:
+                    time.sleep(self.chunk_ms / 1000.0)
+
+                if gen_res['end_of_turn'] or gen_res['is_listen']:
+                    logger.info(f"[Duplex] Silence push ended: {'turn_eos' if gen_res['end_of_turn'] else 'listen'}")
+                    break
+
+                last_chunk_was_speak = not gen_res['is_listen'] and not gen_res['end_of_turn']
+
+            if silence_idx == max_silence_chunks and last_chunk_was_speak:
+                logger.warning(f"[Duplex] Max silence chunks reached, forcing end")
+
+        # ── 6. 计算延迟指标 ──
+        total_elapsed_ms = (time.perf_counter() - infer_start) * 1000
+
+        if first_speak_time_ms is not None:
+            first_response_from_end_ms = first_speak_time_ms - audio_duration_ms
         else:
-            text = result
-            waveform = None
+            first_response_from_end_ms = None
 
-        # 波形转 numpy
-        if waveform is not None and isinstance(waveform, torch.Tensor):
-            waveform = waveform.cpu().numpy()
+        # 拼接最终结果
+        full_text = "".join(all_speak_texts)
+        full_waveform = None
+        if all_audio_chunks:
+            full_waveform = np.concatenate(all_audio_chunks)
+
+        # ── 诊断日志 ──
+        print(f"\n{'='*60}")
+        print(f"[Duplex Result] text='{full_text[:80]}...'")
+        print(f"[Duplex Result] speak_segments={len(all_speak_texts)} audio_chunks={len(all_audio_chunks)}")
+        if first_speak_time_ms is not None:
+            print(f"[Duplex Result] FIRST_RESPONSE (from start): {first_speak_time_ms:.0f}ms")
+            print(f"[Duplex Result] FIRST_RESPONSE (from end):   {first_response_from_end_ms:.0f}ms")
+            if first_response_from_end_ms < 0:
+                print(f"[Duplex Result]  NOTE: 负值 = 系统在用户说完前就开始抢话/插话")
+        else:
+            print(f"[Duplex Result] FIRST_RESPONSE: N/A (never spoke)")
+        print(f"[Duplex Result] TOTAL_E2E: {total_elapsed_ms:.0f}ms")
+        if full_waveform is not None:
+            print(f"[Duplex Result] audio_total: {len(full_waveform)}samples ({len(full_waveform)/24000:.2f}s @ 24kHz)")
+        else:
+            print(f"[Duplex Result] NO AUDIO OUTPUT")
+        print(f"{'='*60}")
+
+        # 清理临时文件
+        try:
+            os.unlink(prompt_wav_path)
+        except OSError:
+            pass
 
         return {
-            "text": text or "",
-            "waveform": waveform,
-            "latency_ms": elapsed_ms,
+            "text": full_text or "",
+            "waveform": full_waveform,
+            "latency_ms": total_elapsed_ms,
+            "first_response_from_start_ms": first_speak_time_ms,
+            "first_response_from_end_ms": first_response_from_end_ms,
             "audio_duration_ms": audio_duration_ms,
         }
+
+    def _process_chunk(
+        self,
+        chunk_idx: int,
+        chunk: np.ndarray,
+        start: int,
+        end: int,
+        unit_records: list,
+        all_speak_texts: list,
+        all_audio_chunks: list,
+        is_silence: bool = False,
+    ):
+        """处理单个 chunk，音频/文本收集逻辑完全参照 infer_debug.py"""
+        import torch
+
+        label = "SILENCE" if is_silence else f"{start/16000:.1f}s~{end/16000:.1f}s"
+        chunk_start_time = time.perf_counter()
+
+        # 1. Prefill
+        prefill_res = self.model.duplex_prefill(audio_waveform=chunk, frame_list=None, max_slice_nums=1)
+
+        # 2. Generate
+        gen_res = self.model.duplex_generate(
+            decode_mode="sampling",
+            temperature=0.7,
+            top_k=20,
+            top_p=0.8,
+            listen_prob_scale=1.0,
+            listen_top_k=5,
+            text_repetition_penalty=1.05,
+            text_repetition_window_size=512,
+            length_penalty=1.1,
+            force_listen_override=False,
+        )
+
+        # 3. Finalize
+        self.model.duplex_finalize()
+
+        chunk_elapsed_ms = (time.perf_counter() - chunk_start_time) * 1000
+
+        # 4. 打印
+        is_listen = gen_res['is_listen']
+        text = gen_res.get('text', '')
+        audio_wav = gen_res.get('audio_waveform')
+        audio_info = "None"
+        if audio_wav is not None:
+            if isinstance(audio_wav, torch.Tensor):
+                audio_wav = audio_wav.cpu().numpy()
+            audio_info = f"{len(audio_wav)}smp/{len(audio_wav)/24000:.2f}s"
+
+        logger.info(
+            f"[Chunk {chunk_idx:3d} {label:12s}] listen={is_listen} text='{text[:20]:20s}' "
+            f"audio={audio_info:18s} cost={chunk_elapsed_ms:6.1f}ms"
+        )
+
+        # 5. 收集音频和文本 —— 完全参照 infer_debug.py
+        if not is_listen and gen_res.get('audio_waveform') is not None:
+            waveform = gen_res['audio_waveform']
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.cpu().numpy()
+            all_audio_chunks.append(waveform)
+            if text:
+                all_speak_texts.append(text)
+
+        # 6. 记录
+        unit_records.append({
+            "chunk_idx": chunk_idx,
+            "is_silence": is_silence,
+            "is_listen": is_listen,
+            "end_of_turn": gen_res['end_of_turn'],
+            "text": text,
+        })
+
+        return gen_res
 
 
 # =============================================================================
@@ -407,10 +531,11 @@ class MiniCPMOLocalInference:
 # =============================================================================
 
 def save_wav(waveform, path: str, sr: int = 24000):
-    """保存音频"""
     if waveform is None:
+        logger.warning(f"save_wav skipped: waveform is None")
         return
     sf.write(path, waveform, samplerate=sr)
+    logger.info(f"Saved audio: {path} ({len(waveform)} samples @ {sr}Hz)")
 
 
 def process_single(
@@ -420,8 +545,8 @@ def process_single(
     output_dir: str,
     provider: str = "minicpmo45_local",
     force: bool = False,
+    ref_audio_path: Optional[str] = None,
 ) -> Optional[Dict]:
-    """处理单个样本 — 参照 run_tool_benchmark.py 的流程"""
     item = data.get(example_id)
     if item is None:
         logger.warning(f"Example {example_id} not found in data — skipping")
@@ -432,7 +557,6 @@ def process_single(
     output_path = out_dir / f"output_{provider}_{pid}_{example_id}.wav"
     result_path = out_dir / f"result_{provider}_{pid}_{example_id}.json"
 
-    # 检查是否已评估
     if result_path.exists() and not force:
         logger.info(f"Already evaluated — skipping (use --force to re-run)")
         return None
@@ -447,13 +571,11 @@ def process_single(
         "evaluated_at": datetime.datetime.now().isoformat(),
     }
 
-    # 判断输入类型
     is_video = str(input_path).endswith(".mp4")
     audio_path = input_path
     video_path = input_path if is_video else None
     result["input_type"] = "video" if is_video else "audio"
 
-    # Step 1: 模型推理
     logger.info(f"Evaluating: {example_id} [{category}] type={result['input_type']}")
     inference_start = time.time()
     try:
@@ -462,6 +584,7 @@ def process_single(
             audio_path=audio_path,
             video_path=video_path,
             system_prompt=system_prompt,
+            ref_audio_path=ref_audio_path,
         )
         inference_time = time.time() - inference_start
         result["inference_time_s"] = round(inference_time, 2)
@@ -471,20 +594,26 @@ def process_single(
 
         result["response_text"] = text
         result["latency_ms"] = round(infer_result["latency_ms"], 1)
+        result["first_response_from_start_ms"] = round(infer_result.get("first_response_from_start_ms"), 1) if infer_result.get("first_response_from_start_ms") is not None else None
+        result["first_response_from_end_ms"] = round(infer_result.get("first_response_from_end_ms"), 1) if infer_result.get("first_response_from_end_ms") is not None else None
 
         # 保存音频
         if waveform is not None:
             save_wav(waveform, str(output_path))
             result["output_audio"] = str(output_path)
+        else:
+            result["output_audio"] = None
+            logger.warning(f"No waveform for {example_id} — model stayed in LISTEN")
 
-        # 计算 RTF
         audio_duration_ms = infer_result["audio_duration_ms"]
         result["input_audio_duration_ms"] = round(audio_duration_ms, 1)
         if audio_duration_ms > 0:
             result["rtf"] = round(infer_result["latency_ms"] / audio_duration_ms, 3)
 
         logger.info(f"  Text: {text[:100]}...")
-        logger.info(f"  E2E: {result['latency_ms']:.0f}ms")
+        if result["first_response_from_start_ms"] is not None:
+            logger.info(f"  FirstResponse(start): {result['first_response_from_start_ms']:.0f}ms")
+            logger.info(f"  FirstResponse(end):   {result['first_response_from_end_ms']:.0f}ms")
 
     except Exception as e:
         logger.error(f"Inference error: {e}", exc_info=True)
@@ -494,9 +623,7 @@ def process_single(
             json.dump(result, f, indent=2, ensure_ascii=False)
         return result
 
-    # Step 2: LLM 裁判（评估人性化，可选）
     if judge and text:
-        # 使用 title 作为 query 的替代（与原始脚本一致，data 中没有 query 字段）
         query_text = item.get("title", "")
         if query_text:
             result["human_likeness"] = judge.evaluate(query_text, text)
@@ -514,22 +641,27 @@ def process_single(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="MiniCPM-o-4.5 Local Evaluation")
-    parser.add_argument("--model-path", required=True, help="模型路径（含 config.json）")
-    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="fdb_v3_data_released 目录")
-    parser.add_argument("--output-dir", default="./eval_results", help="输出目录")
+    parser = argparse.ArgumentParser(description="MiniCPM-o-4.5 Local Evaluation (Full-Duplex Streaming)")
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
+    parser.add_argument("--output-dir", default="./eval_results")
     parser.add_argument("--provider", default="minicpmo45_local")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--pid", help="只处理指定 participant ID")
-    parser.add_argument("--example", help="只处理指定 example ID")
-    parser.add_argument("--force", action="store_true", help="覆盖已有结果")
+    parser.add_argument("--max-speak-tokens", type=int, default=50)
+    parser.add_argument("--chunk-ms", type=int, default=1000,
+                        help="每个 chunk 的时长（毫秒）。默认 1000，可设 100/200/500 等更小值")
+    parser.add_argument("--realtime", action="store_true",
+                        help="启用实时模拟：每处理完一个 chunk，若 GPU 太快则 sleep 到与真实时间对齐")
+    parser.add_argument("--ref-audio", type=str, default=None,
+                        help="TTS 参考音色路径（wav 格式，16kHz）。不指定则默认使用输入音频前 10s")
+    parser.add_argument("--pid")
+    parser.add_argument("--example")
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--data-json", default=str(DATA_JSON_PATH))
-
     args = parser.parse_args()
 
-    # 加载模型
     logger.info("=" * 60)
     logger.info(f"Initializing local model: {args.provider}")
     logger.info("=" * 60)
@@ -539,21 +671,21 @@ def main():
         device=args.device,
         dtype=args.dtype,
         max_new_tokens=args.max_new_tokens,
+        max_speak_tokens=args.max_speak_tokens,
+        chunk_ms=args.chunk_ms,
+        realtime=args.realtime,
     )
 
-    # 加载数据
     data = load_benchmark_data(args.data_json)
     logger.info(f"Loaded {len(data)} scenarios")
 
-    # 发现输入
     inputs = discover_inputs(args.data_dir)
     logger.info(f"Found {len(inputs)} input files")
 
     if not inputs:
-        logger.error("No input files found. Check that fdb_v3_data_released/ exists.")
+        logger.error("No input files found.")
         sys.exit(1)
 
-    # 过滤
     if args.pid:
         inputs = [(p, e, i) for p, e, i in inputs if p == args.pid]
         logger.info(f"Filtered to PID={args.pid}: {len(inputs)}")
@@ -561,10 +693,8 @@ def main():
         inputs = [(p, e, i) for p, e, i in inputs if e == args.example]
         logger.info(f"Filtered to example={args.example}: {len(inputs)}")
 
-    # Judge
     judge = LLMJudge() if INTERNAL_LLM_URL else None
 
-    # 处理所有样本
     success = failed = skipped = 0
     all_results = []
 
@@ -579,6 +709,7 @@ def main():
             pid, example_id, input_path, model,
             data, judge, args.output_dir,
             args.provider, args.force,
+            ref_audio_path=args.ref_audio,
         )
 
         if result is None:
@@ -590,13 +721,20 @@ def main():
             all_results.append(result)
             failed += 1
 
-    # Summary
     logger.info(f"\n{'='*60}")
     logger.info(f"Evaluation Summary ({args.provider})")
     logger.info(f"Completed: {success}, Failed: {failed}, Skipped: {skipped}")
 
     completed = [r for r in all_results if r.get("status") == "completed"]
     if completed:
+        fr_start = [r["first_response_from_start_ms"] for r in completed if r.get("first_response_from_start_ms") is not None]
+        if fr_start:
+            logger.info(f"Avg FirstResponse(from start): {statistics.mean(fr_start):.0f}ms")
+
+        fr_end = [r["first_response_from_end_ms"] for r in completed if r.get("first_response_from_end_ms") is not None]
+        if fr_end:
+            logger.info(f"Avg FirstResponse(from end):   {statistics.mean(fr_end):.0f}ms")
+
         latencies = [r["latency_ms"] for r in completed]
         logger.info(f"Avg E2E latency: {statistics.mean(latencies):.0f}ms")
 
@@ -609,7 +747,6 @@ def main():
             if scores:
                 logger.info(f"Avg human-likeness: {statistics.mean(scores):.1f}/5")
 
-    # Save aggregate summary
     summary_path = Path(args.output_dir) / f"evaluation_summary_{args.provider}.json"
     with open(summary_path, "w") as f:
         json.dump({
