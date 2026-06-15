@@ -325,8 +325,8 @@ def run_half_duplex(model, tokenizer, msgs, audio_input, tts_ref_audio, args):
         full_seq = torch.cat([input_ids[0].cpu(), generated_ids.cpu()])
         full_seq_list = full_seq.tolist()
 
-        tts_bos_id = tokenizer.convert_tokens_to_ids("||<|<|tts_bos|>")
-        tts_eos_id = tokenizer.convert_tokens_to_ids("||<|<|tts_eos|>")
+        tts_bos_id = tokenizer.convert_tokens_to_ids("<|tts_bos|>")
+        tts_eos_id = tokenizer.convert_tokens_to_ids("<|tts_eos|>")
         tts_bos_positions = [i for i, x in enumerate(full_seq_list) if x == tts_bos_id]
         tts_eos_positions = [i for i, x in enumerate(full_seq_list) if x == tts_eos_id]
 
@@ -397,8 +397,8 @@ def run_full_duplex(model, tokenizer, audio_input, args):
     ref_audio = audio_input
     prompt_wav_path = args.ref_audio or args.input_audio
 
-    prefix = "||<|<|im_start|>system\nYou are a helpful assistant.\n<<||<|<|audio_start|>"
-    suffix = "||<|<|audio_end|>哦"
+    prefix = "<|im_start|>system\nYou are a helpful assistant.\n<|audio_start|>"
+    suffix = "<|audio_end|>"
 
     full_prompt = model.duplex_prepare(
         prefix_system_prompt=prefix,
@@ -608,10 +608,10 @@ def _process_chunk(model, tokenizer, chunk_idx, chunk, start, end, unit_records,
         print(f"\n>>> 输出 Token IDs (len={len(current_gen_ids)})：")
         print(current_gen_ids)
 
-        listen_id = tokenizer.convert_tokens_to_ids("||<|<|listen|>")
-        speak_id = tokenizer.convert_tokens_to_ids("||<|<|speak|>")
-        chunk_eos_id = tokenizer.convert_tokens_to_ids("||<|<|chunk_eos|>")
-        turn_eos_id = tokenizer.convert_tokens_to_ids("||<|<|turn_eos|>")
+        listen_id = tokenizer.convert_tokens_to_ids("<|listen|>")
+        speak_id = tokenizer.convert_tokens_to_ids("<|speak|>")
+        chunk_eos_id = tokenizer.convert_tokens_to_ids("<|chunk_eos|>")
+        turn_eos_id = tokenizer.convert_tokens_to_ids("<|turn_eos|>")
 
         has_listen = listen_id in current_gen_ids
         has_speak = speak_id in current_gen_ids
