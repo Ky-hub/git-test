@@ -313,8 +313,8 @@ class MiniCPMOLocalInference:
         # ── 关键修正：prefix/suffix 严格与 infer_debug.py 一致 ──
         # 错误示范（之前）：prefix = f"||<<||<|im_start|>system..."  ← 多了 ||<< 导致 tokenizer 无法识别特殊 token
         # 正确格式（如下）：纯字符串，让 tokenizer 正确识别 <|im_start|> 等特殊 token
-        prefix = f"||<|im_start|>system\n{system_prompt}\n<<||<|audio_start|>"
-        suffix = "||<|audio_end|>"
+        prefix = f"<|im_start|>system\n{system_prompt}\n<|audio_start|>"
+        suffix = "<|audio_end|>"
 
         full_prompt = self.model.duplex_prepare(
             prefix_system_prompt=prefix,
