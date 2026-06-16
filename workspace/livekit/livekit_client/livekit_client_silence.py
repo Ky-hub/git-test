@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LiveKit 实时交互模拟评测脚本（零阻塞发送 + 接收音频保存版）
+LiveKit 实时交互模拟评测脚本（Ctrl+C 手动控制关闭版）
 """
 
 import argparse
@@ -276,8 +276,8 @@ class EvalClient:
         self._recv_silence_start = 0.0
 
         # 音频保存相关
-        self._recv_audio_buffers: Dict[str, List[bytes]] = {}   # track_sid -> list of bytes
-        self._recv_audio_params: Dict[str, dict] = {}           # track_sid -> {sr, ch, width}
+        self._recv_audio_buffers: Dict[str, List[bytes]] = {}
+        self._recv_audio_params: Dict[str, dict] = {}
         self._recv_audio_saved: set = set()
 
         # 同步原语
@@ -497,6 +497,7 @@ class EvalClient:
         send_task = asyncio.create_task(self.send_audio_file(), name="send-audio")
         await send_task
 
+        # 等待首响（收到或超时）
         got_response = await self.wait_for_first_response(
             timeout=self.config.wait_for_remote_timeout
         )
@@ -512,8 +513,17 @@ class EvalClient:
         else:
             print(f"[!] [{now_iso()}] 未能计算首响时延")
 
-        print(f"[*] [{now_iso()}] 等待 5 秒收集后续音频...")
-        await asyncio.sleep(5.0)
+        # ========== 关键改动：发送完成后持续收集，直到 Ctrl+C ==========
+        print(f"\n[*] [{now_iso()}] 发送完成，持续接收远端音频中...")
+        print(f"    按 Ctrl+C 停止并保存音频\n")
+        try:
+            while self._running:
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+
+        # 这里不会自动执行，因为 while 循环只在 _running=False 时退出
+        # 而 _running=False 由 shutdown() 设置，shutdown() 会在退出时保存音频
         await self.shutdown()
 
     async def shutdown(self):
@@ -547,7 +557,6 @@ class EvalClient:
     # ---------- 音频保存工具 ----------
 
     def _save_recv_audio(self, track_sid: str, participant_identity: str = "unknown"):
-        """将接收到的音频缓冲区保存为 WAV 文件"""
         if track_sid in self._recv_audio_saved:
             return
         self._recv_audio_saved.add(track_sid)
@@ -562,10 +571,8 @@ class EvalClient:
             print(f"[!] [{now_iso()}] 音频缓冲区为空，跳过保存: {track_sid}")
             return
 
-        # 合并所有音频数据
         audio_data = b"".join(buffer)
 
-        # 文件名
         safe_identity = participant_identity.replace("/", "_").replace("\\", "_")
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"recv_{ts}_{track_sid}_{safe_identity}.wav"
@@ -578,7 +585,8 @@ class EvalClient:
                 wf.setframerate(params["sample_rate"])
                 wf.writeframes(audio_data)
             print(f"[+] [{now_iso()}] 接收音频已保存: {filepath}")
-            print(f"    大小: {total_bytes} bytes, 时长: ~{total_bytes / params['sample_rate'] / params['width'] / params['channels']:.2f}s")
+            duration = total_bytes / params["sample_rate"] / params["width"] / params["channels"]
+            print(f"    大小: {total_bytes} bytes, 时长: ~{duration:.2f}s")
         except Exception as e:
             print(f"[!] [{now_iso()}] 保存音频失败 ({track_sid}): {e}")
 
@@ -604,7 +612,6 @@ class EvalClient:
 
     def _on_track_unsubscribed(self, track: Track, publication: TrackPublication, participant):
         print(f"[-] [{now_iso()}] 取消订阅: {track.sid}")
-        # 取消订阅时立即保存该 track 的音频
         if self.config.save_recv_audio and track.sid in self._recv_audio_buffers:
             self._save_recv_audio(track.sid, participant.identity)
 
@@ -633,25 +640,22 @@ class EvalClient:
 
                 # 保存音频数据
                 if self.config.save_recv_audio:
-                    # 首帧时记录音频参数
                     if first_frame:
                         first_frame = False
                         self._recv_audio_params[track_sid] = {
                             "sample_rate": frame.sample_rate,
                             "channels": frame.num_channels,
-                            "width": 2,  # int16 = 2 bytes
+                            "width": 2,
                         }
                         self._recv_audio_buffers[track_sid] = []
                         print(f"    [{now_iso()}] 开始缓存接收音频: {track_sid} "
                               f"({frame.sample_rate}Hz, {frame.num_channels}ch)")
 
-                    # 将 frame data 转为 bytes 追加到缓冲区
                     if hasattr(frame.data, "tobytes"):
                         self._recv_audio_buffers[track_sid].append(frame.data.tobytes())
                     elif isinstance(frame.data, (bytes, bytearray)):
                         self._recv_audio_buffers[track_sid].append(bytes(frame.data))
                     else:
-                        # 其他类型（如 memoryview），用 numpy 转
                         arr = np.asarray(frame.data, dtype=np.int16)
                         self._recv_audio_buffers[track_sid].append(arr.tobytes())
 
@@ -712,8 +716,7 @@ class EvalClient:
             traceback.print_exc()
         finally:
             print(f"[-] [{now_iso()}] 接收结束: {track_sid}, 总帧 {frame_index}, 有效 {self._recv_valid_frames}")
-            # 任务结束时保存音频（如果尚未保存）
-            if self.config.save_recv_audio and track.sid in self._recv_audio_buffers:
+            if self.config.save_recv_audio and track_sid in self._recv_audio_buffers:
                 self._save_recv_audio(track_sid, identity)
 
 
@@ -734,7 +737,7 @@ async def main():
     loop = asyncio.get_running_loop()
 
     def _signal_handler(sig):
-        print(f"\n[!] [{now_iso()}] 信号 {sig.name}")
+        print(f"\n[!] [{now_iso()}] 收到信号 {sig.name}，开始关闭...")
         asyncio.create_task(client.shutdown())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -750,8 +753,9 @@ async def main():
     try:
         await client.run()
     except KeyboardInterrupt:
-        await client.shutdown()
+        pass
     finally:
+        # 确保 shutdown 被调用（如果信号处理已经调用了，这里会检查 _running 直接返回）
         await client.shutdown()
 
 
