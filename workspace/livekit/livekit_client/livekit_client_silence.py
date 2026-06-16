@@ -1,32 +1,6 @@
 #!/usr/bin/env python3
 """
-LiveKit Python 客户端 (配置驱动版 + 音频帧监听日志 + 静音检测)
-【重写】基于显式状态机的 utterance 检测，彻底分离"静音确认"和"分段触发"逻辑。
-
-状态机:
-    IDLE → SPEAKING → SILENCE_CANDIDATE → SILENCE_CONFIRMED ─┬─→ SPEAKING (同一段，静音太短)
-                                                              └─→ SPEAKING_NEW (新 utterance，静音够长)
-
-关键参数:
-    silence_confirmation_frames: 连续多少帧静音才"确认"进入静音期（过滤抖动/换气）
-    min_silence_ms:            确认静音后，需持续多久才允许触发新 utterance（真正分段阈值）
-
-依赖:
-    pip install livekit livekit-api sounddevice numpy
-
-配置文件 (config.json):
-    {
-        "livekit_url": "wss://...",
-        "livekit_api_key": "...",
-        "livekit_api_secret": "...",
-        "room_name": "test-room",
-        "agent_name": "python-agent",
-        "log_dir": "./audio_logs",
-        "log_flush_interval": 1.0,
-        "silence_threshold": 100,
-        "silence_confirmation_frames": 30,
-        "min_silence_ms": 800
-    }
+LiveKit 实时交互模拟评测脚本（零阻塞发送 + 接收音频保存版）
 """
 
 import argparse
@@ -35,21 +9,26 @@ import json
 import signal
 import sys
 import time
+import wave
+import threading
 from pathlib import Path
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from enum import Enum, auto
 
 import numpy as np
-import sounddevice as sd
 
 from livekit import api, rtc
 from livekit.rtc import (
     Room, RoomOptions, ConnectionState,
     Track, TrackPublication, TrackKind,
-    AudioStream, AudioFrame, AudioFrameEvent,
-    AudioSource, LocalAudioTrack,
+    AudioStream, AudioFrame, AudioSource, LocalAudioTrack,
 )
+
+# Windows 提升定时器精度到 1ms
+if sys.platform == "win32":
+    import ctypes
+    ctypes.windll.winmm.timeBeginPeriod(1)
 
 
 # ========================== 配置 ==========================
@@ -61,17 +40,15 @@ class Config:
         self.livekit_api_secret = self._require(data, "livekit_api_secret")
         self.room_name = self._require(data, "room_name")
         self.agent_name = self._require(data, "agent_name")
-        self.sample_rate = data.get("sample_rate", 48000)
+        self.audio_file = self._require(data, "audio_file")
+        self.chunk_duration_ms = data.get("chunk_duration_ms", 40)
+        self.sample_rate = data.get("sample_rate", 24000)
         self.channels = data.get("channels", 1)
-        self.publish_mic = data.get("publish_mic", True)
-        self.log_dir = data.get("log_dir", "./audio_logs")
-        self.log_flush_interval = data.get("log_flush_interval", 1.0)
         self.silence_threshold = data.get("silence_threshold", 100)
-        # 连续静音多少帧才确认进入静音期（过滤单帧抖动）
         self.silence_confirmation_frames = data.get("silence_confirmation_frames", 30)
-        # 【核心】确认静音后，需持续多久才触发新 utterance（毫秒）
-        # 设大值可避免短停顿被切分。例如 800ms 意味着停顿 < 800ms 视为同一段话
-        self.min_silence_ms = data.get("min_silence_ms", 800)
+        self.log_dir = data.get("log_dir", "./eval_logs")
+        self.save_recv_audio = data.get("save_recv_audio", True)
+        self.wait_for_remote_timeout = data.get("wait_for_remote_timeout", 30.0)
 
     @staticmethod
     def _require(data, key):
@@ -83,6 +60,17 @@ class Config:
     def from_json(cls, path):
         with open(Path(path), "r", encoding="utf-8") as f:
             return cls(json.load(f))
+
+
+# ========================== 时间格式化工具 ==========================
+
+def fmt_ts(ts: Optional[float]) -> str:
+    if ts is None:
+        return "N/A"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+def now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 # ========================== Token ==========================
@@ -102,35 +90,38 @@ def generate_token(config: Config) -> str:
     return token.to_jwt()
 
 
-# ========================== 静音检测工具 ==========================
+# ========================== 静音检测 ==========================
 
 def is_silence_frame(frame: AudioFrame, threshold: int = 100) -> tuple[bool, int]:
     if not hasattr(frame.data, "__len__") or len(frame.data) == 0:
         return True, 0
-    audio_data = np.asarray(frame.data, dtype=np.int16)
+    audio_data = np.frombuffer(frame.data, dtype=np.int16)
     if audio_data.size == 0:
         return True, 0
     peak = int(np.max(np.abs(audio_data)))
     return peak < threshold, peak
 
 
-# ========================== 音频帧日志记录器 ==========================
+# ========================== 日志记录器（零阻塞版）==========================
 
-class AudioFrameLogger:
-    def __init__(self, log_dir: str, flush_interval: float = 1.0):
+class EvalLogger:
+    def __init__(self, log_dir: str, session_id: str):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.flush_interval = flush_interval
-        self._files: Dict[str, Any] = {}
-        self._buffers: Dict[str, list] = {}
-        self._lock = asyncio.Lock()
-        self._session_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_id = session_id
+        self._lock = threading.Lock()
+        self._buffer: list = []
+        self._flush_interval = 0.5
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
-        self._first_frame_logged: Set[str] = set()
-        self._utterance_counter: Dict[str, int] = {}
+        self._file = None
 
     async def start(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._file = open(
+            self.log_dir / f"eval_{self.session_id}_{ts}.jsonl",
+            "w", encoding="utf-8", buffering=1
+        )
         self._running = True
         self._flush_task = asyncio.create_task(self._flush_loop())
 
@@ -142,522 +133,588 @@ class AudioFrameLogger:
                 await self._flush_task
             except asyncio.CancelledError:
                 pass
-        async with self._lock:
-            for sid, buf in list(self._buffers.items()):
-                if buf:
-                    self._write_buffer(sid, buf)
-                self._buffers[sid] = []
-            for fh in self._files.values():
-                try:
-                    fh.flush()
-                    fh.close()
-                except Exception:
-                    pass
-            self._files.clear()
+        with self._lock:
+            self._flush()
+            if self._file:
+                self._file.close()
+                self._file = None
 
-    def _get_filepath(self, track_sid: str, participant: str) -> Path:
-        safe = participant.replace("/", "_").replace("\\", "_")
-        return self.log_dir / f"{self._session_time}_{track_sid}_{safe}.jsonl"
-
-    def _get_filehandle(self, track_sid: str, participant: str):
-        if track_sid not in self._files:
-            fp = self._get_filepath(track_sid, participant)
-            self._files[track_sid] = open(fp, "w", encoding="utf-8", buffering=1)
-            print(f"[LOG] 创建日志: {fp}")
-        return self._files[track_sid]
-
-    def _write_buffer(self, sid: str, buffer: list):
-        if not buffer:
+    def _flush(self):
+        if not self._buffer or not self._file:
             return
-        fh = self._files.get(sid)
-        if fh:
-            try:
-                fh.write("\n".join(buffer) + "\n")
-                fh.flush()
-            except Exception as e:
-                print(f"[!] 日志写入失败 ({sid}): {e}")
+        try:
+            self._file.write("\n".join(self._buffer) + "\n")
+            self._file.flush()
+            self._buffer.clear()
+        except Exception as e:
+            print(f"[!] 日志写入失败: {e}")
 
     async def _flush_loop(self):
         while self._running:
-            await asyncio.sleep(self.flush_interval)
-            async with self._lock:
-                for sid, buf in list(self._buffers.items()):
-                    if buf:
-                        self._write_buffer(sid, buf)
-                        self._buffers[sid] = []
+            await asyncio.sleep(self._flush_interval)
+            with self._lock:
+                self._flush()
 
-    async def _append(self, track_sid: str, participant: str, record: dict, flush_now: bool = False):
-        async with self._lock:
-            if track_sid not in self._buffers:
-                self._buffers[track_sid] = []
-                self._get_filehandle(track_sid, participant)
-            self._buffers[track_sid].append(json.dumps(record, ensure_ascii=False))
-            if flush_now and self._buffers[track_sid]:
-                self._write_buffer(track_sid, self._buffers[track_sid])
-                self._buffers[track_sid] = []
+    def log(self, record: dict):
+        record["session_id"] = self.session_id
+        if "timestamp" not in record:
+            record["timestamp"] = time.time()
+        if "timestamp_ns" not in record:
+            record["timestamp_ns"] = time.time_ns()
+        if "iso_time" not in record:
+            record["iso_time"] = fmt_ts(record["timestamp"])
+        self._buffer.append(json.dumps(record, ensure_ascii=False))
 
-    async def log_session_start(self, track_sid: str, participant: str,
-                                sample_rate: int, num_channels: int,
-                                silence_threshold: int,
-                                silence_confirmation_frames: int,
-                                min_silence_ms: int):
-        record = {
+    def log_session_start(self, audio_file: str, chunk_duration_ms: int,
+                          sample_rate: int, channels: int):
+        self.log({
             "event": "session_start",
-            "timestamp": time.time(),
-            "timestamp_ns": time.time_ns(),
-            "track_sid": track_sid,
-            "participant_identity": participant,
+            "audio_file": audio_file,
+            "chunk_duration_ms": chunk_duration_ms,
             "sample_rate": sample_rate,
-            "num_channels": num_channels,
-            "silence_threshold": silence_threshold,
-            "silence_confirmation_frames": silence_confirmation_frames,
-            "min_silence_ms": min_silence_ms,
-        }
-        await self._append(track_sid, participant, record)
+            "num_channels": channels,
+        })
 
-    async def log_first_frame(self, track_sid: str, participant: str, frame: AudioFrame, peak: int):
-        if track_sid in self._first_frame_logged:
-            return
-        self._first_frame_logged.add(track_sid)
-        self._utterance_counter[track_sid] = 1
+    def log_chunk_sent(self, chunk_index: int, bytes_sent: int,
+                       samples: int, is_last: bool,
+                       scheduled_time_mono: float, actual_time_mono: float,
+                       jitter_ms: float, interval_ms: float,
+                       send_cost_ms: float, iso_time: str):
+        self.log({
+            "event": "chunk_sent",
+            "chunk_index": chunk_index,
+            "bytes_sent": bytes_sent,
+            "samples": samples,
+            "is_last": is_last,
+            "scheduled_time_mono": round(scheduled_time_mono, 6),
+            "actual_time_mono": round(actual_time_mono, 6),
+            "jitter_ms": round(jitter_ms, 3),
+            "interval_ms": round(interval_ms, 3),
+            "send_cost_ms": round(send_cost_ms, 3),
+            "iso_time": iso_time,
+        })
 
-        data_bytes = len(frame.data) if hasattr(frame.data, "__len__") else 0
-        samples = getattr(frame, "samples_per_channel", data_bytes // (frame.num_channels * 2))
-        duration_ms = (samples / frame.sample_rate) * 1000.0 if frame.sample_rate > 0 else 0.0
-        now = time.time()
-
-        record = {
-            "event": "first_frame",
-            "timestamp": now,
-            "timestamp_ns": time.time_ns(),
+    def log_recv_frame(self, track_sid: str, frame_index: int,
+                       peak: int, is_silence: bool, is_first_valid: bool):
+        self.log({
+            "event": "recv_frame",
             "track_sid": track_sid,
-            "participant_identity": participant,
-            "utterance_index": 1,
-            "sample_rate": frame.sample_rate,
-            "num_channels": frame.num_channels,
-            "samples_per_channel": samples,
-            "data_bytes": data_bytes,
-            "duration_ms": round(duration_ms, 3),
-            "peak_amplitude": peak,
-            "iso_time": datetime.fromtimestamp(now).isoformat(),
-        }
-        await self._append(track_sid, participant, record, flush_now=True)
-
-    async def log_utterance_first_frame(self, track_sid: str, participant: str,
-                                        frame: AudioFrame, silence_duration_ms: float, peak: int):
-        self._utterance_counter[track_sid] = self._utterance_counter.get(track_sid, 0) + 1
-        idx = self._utterance_counter[track_sid]
-
-        data_bytes = len(frame.data) if hasattr(frame.data, "__len__") else 0
-        samples = getattr(frame, "samples_per_channel", data_bytes // (frame.num_channels * 2))
-        duration_ms = (samples / frame.sample_rate) * 1000.0 if frame.sample_rate > 0 else 0.0
-        now = time.time()
-
-        record = {
-            "event": "utterance_first_frame",
-            "timestamp": now,
-            "timestamp_ns": time.time_ns(),
-            "track_sid": track_sid,
-            "participant_identity": participant,
-            "utterance_index": idx,
-            "silence_duration_ms": round(silence_duration_ms, 3),
-            "sample_rate": frame.sample_rate,
-            "num_channels": frame.num_channels,
-            "samples_per_channel": samples,
-            "data_bytes": data_bytes,
-            "duration_ms": round(duration_ms, 3),
-            "peak_amplitude": peak,
-            "iso_time": datetime.fromtimestamp(now).isoformat(),
-        }
-        await self._append(track_sid, participant, record, flush_now=True)
-
-    async def log_frame(self, track_sid: str, participant: str,
-                        frame_index: int, frame: AudioFrame, peak: int):
-        data_bytes = len(frame.data) if hasattr(frame.data, "__len__") else 0
-        samples = getattr(frame, "samples_per_channel", data_bytes // (frame.num_channels * 2))
-        duration_ms = (samples / frame.sample_rate) * 1000.0 if frame.sample_rate > 0 else 0.0
-
-        record = {
-            "event": "frame",
-            "timestamp": time.time(),
-            "timestamp_ns": time.time_ns(),
-            "track_sid": track_sid,
-            "participant_identity": participant,
             "frame_index": frame_index,
-            "sample_rate": frame.sample_rate,
-            "num_channels": frame.num_channels,
-            "samples_per_channel": samples,
-            "data_bytes": data_bytes,
-            "duration_ms": round(duration_ms, 3),
             "peak_amplitude": peak,
-        }
-        await self._append(track_sid, participant, record)
+            "is_silence": is_silence,
+            "is_first_valid": is_first_valid,
+        })
 
-    async def log_silence_period(self, track_sid: str, participant: str,
-                                  silence_frames: int, duration_ms: float):
-        record = {
-            "event": "silence_period",
-            "timestamp": time.time(),
-            "timestamp_ns": time.time_ns(),
+    def log_first_valid_frame(self, track_sid: str, frame_index: int,
+                              peak: int, silence_frames: int,
+                              silence_duration_ms: float):
+        self.log({
+            "event": "first_valid_frame",
             "track_sid": track_sid,
-            "participant_identity": participant,
-            "silence_frames": silence_frames,
-            "silence_duration_ms": round(duration_ms, 3),
-        }
-        await self._append(track_sid, participant, record)
+            "frame_index": frame_index,
+            "peak_amplitude": peak,
+            "silence_frames_before": silence_frames,
+            "silence_duration_ms": round(silence_duration_ms, 3),
+        })
 
-    async def log_session_end(self, track_sid: str, participant: str,
-                              total_frames: int, total_duration_ms: float):
+    def log_latency(self, first_response_latency_ms: float,
+                    send_last_ts: float, recv_first_ts: float):
+        self.log({
+            "event": "latency_calculated",
+            "first_response_latency_ms": round(first_response_latency_ms, 3),
+            "send_last_timestamp": send_last_ts,
+            "send_last_iso": fmt_ts(send_last_ts),
+            "recv_first_timestamp": recv_first_ts,
+            "recv_first_iso": fmt_ts(recv_first_ts),
+        })
+
+    def log_session_end(self, total_sent_chunks: int, total_recv_frames: int,
+                        total_valid_frames: int,
+                        jitter_stats: Optional[dict] = None):
         record = {
             "event": "session_end",
-            "timestamp": time.time(),
-            "timestamp_ns": time.time_ns(),
-            "track_sid": track_sid,
-            "participant_identity": participant,
-            "total_utterances": self._utterance_counter.get(track_sid, 0),
-            "total_frames": total_frames,
-            "total_duration_ms": round(total_duration_ms, 3),
+            "total_sent_chunks": total_sent_chunks,
+            "total_recv_frames": total_recv_frames,
+            "total_valid_frames": total_valid_frames,
         }
-        async with self._lock:
-            fh = self._get_filehandle(track_sid, participant)
-            if track_sid in self._buffers and self._buffers[track_sid]:
-                self._write_buffer(track_sid, self._buffers[track_sid])
-                self._buffers[track_sid] = []
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-            fh.flush()
+        if jitter_stats:
+            record["jitter_stats"] = jitter_stats
+        self.log(record)
+
+
+# ========================== 状态机 ==========================
+
+class RecvState(Enum):
+    IDLE = auto()
+    SILENCE_CANDIDATE = auto()
+    SPEAKING = auto()
 
 
 # ========================== 客户端核心 ==========================
 
-class AudioState(Enum):
-    """音频接收状态机"""
-    IDLE = auto()              # 初始，未收到有效音频
-    SPEAKING = auto()          # 正在接收有效音频（非静音）
-    SILENCE_CANDIDATE = auto() # 出现静音帧，候选中（可能短暂停顿）
-    SILENCE_CONFIRMED = auto() # 已确认进入静音期（连续静音帧达标）
-
-
-class LiveKitClient:
+class EvalClient:
     def __init__(self, config: Config):
         self.config = config
         self.room: Optional[Room] = None
         self._running = False
         self._tasks: list = []
-        self.audio_streams: Dict[str, AudioStream] = {}
-        self.audio_players: Dict[str, sd.OutputStream] = {}
-        self.local_audio_source: Optional[AudioSource] = None
-        self.local_audio_track: Optional[LocalAudioTrack] = None
-        self.frame_logger = AudioFrameLogger(
-            log_dir=config.log_dir,
-            flush_interval=config.log_flush_interval,
-        )
+        self.audio_source: Optional[AudioSource] = None
+        self.audio_track: Optional[LocalAudioTrack] = None
+        self.logger = EvalLogger(config.log_dir, config.agent_name)
+
+        # 发送相关
+        self._send_last_ts: Optional[float] = None
+        self._total_sent_chunks = 0
+
+        # 接收相关
+        self._recv_first_ts: Optional[float] = None
+        self._recv_total_frames = 0
+        self._recv_valid_frames = 0
+        self._latency_measured = False
+        self._recv_state = RecvState.IDLE
+        self._recv_silence_count = 0
+        self._recv_silence_start = 0.0
+
+        # 音频保存相关
+        self._recv_audio_buffers: Dict[str, List[bytes]] = {}   # track_sid -> list of bytes
+        self._recv_audio_params: Dict[str, dict] = {}           # track_sid -> {sr, ch, width}
+        self._recv_audio_saved: set = set()
+
+        # 同步原语
+        self._recv_first_event = asyncio.Event()
 
     async def connect(self):
         self.room = Room()
         self.room.on("connected", self._on_connected)
         self.room.on("disconnected", self._on_disconnected)
-        self.room.on("connection_state_changed", self._on_connection_state_changed)
-        self.room.on("participant_connected", self._on_participant_connected)
-        self.room.on("participant_disconnected", self._on_participant_disconnected)
         self.room.on("track_subscribed", self._on_track_subscribed)
         self.room.on("track_unsubscribed", self._on_track_unsubscribed)
 
         token = generate_token(self.config)
-        print(f"[*] 正在连接房间: {self.config.room_name} @ {self.config.livekit_url}")
+        print(f"[*] [{now_iso()}] 连接房间: {self.config.room_name}")
         await self.room.connect(self.config.livekit_url, token,
                                 options=RoomOptions(auto_subscribe=True))
-        print(f"[+] 已连接: {self.room.name}, identity={self.room.local_participant.identity}")
+        print(f"[+] [{now_iso()}] 已连接: identity={self.room.local_participant.identity}")
         self._running = True
-        await self.frame_logger.start()
+        await self.logger.start()
 
-    async def publish_microphone(self):
+    async def publish_audio_track(self):
         cfg = self.config
-        print(f"[*] 发布麦克风 ({cfg.sample_rate}Hz, {cfg.channels}ch)...")
-        self.local_audio_source = rtc.AudioSource(
+        print(f"[*] [{now_iso()}] 发布音频轨道 ({cfg.sample_rate}Hz, {cfg.channels}ch)...")
+        self.audio_source = rtc.AudioSource(
             sample_rate=cfg.sample_rate, num_channels=cfg.channels)
-        self.local_audio_track = LocalAudioTrack.create_audio_track(
-            "microphone", self.local_audio_source)
+        self.audio_track = LocalAudioTrack.create_audio_track(
+            "simulated_audio", self.audio_source)
         publish_options = rtc.TrackPublishOptions()
         publish_options.source = rtc.TrackSource.SOURCE_MICROPHONE
         publication = await self.room.local_participant.publish_track(
-            self.local_audio_track, publish_options)
-        print(f"[+] 麦克风已发布, sid={publication.sid}")
-        task = asyncio.create_task(
-            self._microphone_capture_task(cfg.sample_rate, cfg.channels), name="mic-capture")
-        self._tasks.append(task)
+            self.audio_track, publish_options)
+        print(f"[+] [{now_iso()}] 音频轨道已发布, sid={publication.sid}")
+
+    async def send_audio_file(self):
+        """读取 WAV 文件并分 chunk 模拟实时发送（零阻塞版）"""
+        cfg = self.config
+        audio_path = Path(cfg.audio_file)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"音频文件不存在: {audio_path}")
+
+        with wave.open(str(audio_path), 'rb') as wf:
+            file_sr = wf.getframerate()
+            file_ch = wf.getnchannels()
+            file_width = wf.getsampwidth()
+            total_frames = wf.getnframes()
+            raw_data = wf.readframes(total_frames)
+
+        print(f"[+] [{now_iso()}] 加载音频: {audio_path}")
+        print(f"    采样率={file_sr}Hz, 通道={file_ch}, 位深={file_width*8}bit, 总帧={total_frames}")
+
+        if file_sr != cfg.sample_rate or file_ch != cfg.channels:
+            print(f"[!] 警告: 文件参数({file_sr}Hz, {file_ch}ch)与配置({cfg.sample_rate}Hz, {cfg.channels}ch)不一致")
+
+        bytes_per_sample = cfg.channels * 2
+        samples_per_chunk = int(cfg.sample_rate * cfg.chunk_duration_ms / 1000)
+        bytes_per_chunk = samples_per_chunk * bytes_per_sample
+
+        audio_np = np.frombuffer(raw_data, dtype=np.int16)
+        if file_ch != cfg.channels:
+            if file_ch == 2 and cfg.channels == 1:
+                audio_np = audio_np.reshape(-1, 2).mean(axis=1).astype(np.int16)
+            else:
+                raise ValueError("通道数转换不支持")
+
+        if file_sr != cfg.sample_rate:
+            ratio = cfg.sample_rate / file_sr
+            new_len = int(len(audio_np) * ratio)
+            audio_np = np.interp(
+                np.linspace(0, len(audio_np), new_len, endpoint=False),
+                np.arange(len(audio_np)),
+                audio_np
+            ).astype(np.int16)
+
+        audio_bytes = audio_np.tobytes()
+        total_len = len(audio_bytes)
+        chunk_index = 0
+        offset = 0
+
+        self.logger.log_session_start(
+            str(audio_path), cfg.chunk_duration_ms, cfg.sample_rate, cfg.channels
+        )
+
+        print(f"[*] [{now_iso()}] 开始发送音频，chunk_size={bytes_per_chunk} bytes, 预计 {total_len // bytes_per_chunk + 1} 个 chunk")
+
+        start_mono = time.monotonic()
+        interval_sec = cfg.chunk_duration_ms / 1000.0
+        jitters: List[float] = []
+        prev_actual_mono = start_mono
+        overdue_count = 0
+        warn_threshold_ms = cfg.chunk_duration_ms * 0.5
+
+        while offset < total_len:
+            if not self._running:
+                print(f"[!] [{now_iso()}] 发送中断")
+                break
+
+            target_mono = start_mono + (chunk_index * interval_sec)
+
+            end = min(offset + bytes_per_chunk, total_len)
+            chunk = audio_bytes[offset:end]
+            actual_samples = len(chunk) // bytes_per_sample
+            frame = AudioFrame(
+                data=chunk,
+                sample_rate=cfg.sample_rate,
+                num_channels=cfg.channels,
+                samples_per_channel=actual_samples
+            )
+
+            now_mono = time.monotonic()
+            sleep_needed = target_mono - now_mono
+
+            if sleep_needed > 0.001:
+                await asyncio.sleep(sleep_needed - 0.001)
+                while time.monotonic() < target_mono:
+                    pass
+            elif sleep_needed > 0:
+                while time.monotonic() < target_mono:
+                    pass
+            else:
+                overdue_count += 1
+
+            pre_send_mono = time.monotonic()
+            pre_send_wall = time.time()
+            await self.audio_source.capture_frame(frame)
+            post_send_mono = time.monotonic()
+
+            self._total_sent_chunks += 1
+            is_last = (end >= total_len)
+
+            jitter_ms = (pre_send_mono - target_mono) * 1000.0
+            interval_ms = (pre_send_mono - prev_actual_mono) * 1000.0 if chunk_index > 0 else 0.0
+            send_cost_ms = (post_send_mono - pre_send_mono) * 1000.0
+            jitters.append(jitter_ms)
+            prev_actual_mono = pre_send_mono
+
+            pre_send_iso = fmt_ts(pre_send_wall)
+            if chunk_index % 50 == 0 or abs(jitter_ms) > warn_threshold_ms or send_cost_ms > warn_threshold_ms:
+                flag = ""
+                if abs(jitter_ms) > warn_threshold_ms:
+                    flag += " [JITTER]"
+                if send_cost_ms > warn_threshold_ms:
+                    flag += " [SLOW_SEND]"
+                print(f"    [{pre_send_iso}] #{chunk_index:04d} | "
+                      f"interval={interval_ms:6.2f}ms | jitter={jitter_ms:+6.2f}ms | "
+                      f"send_cost={send_cost_ms:5.2f}ms{flag}")
+
+            self.logger.log_chunk_sent(
+                chunk_index=chunk_index,
+                bytes_sent=len(chunk),
+                samples=actual_samples,
+                is_last=is_last,
+                scheduled_time_mono=target_mono,
+                actual_time_mono=pre_send_mono,
+                jitter_ms=jitter_ms,
+                interval_ms=interval_ms,
+                send_cost_ms=send_cost_ms,
+                iso_time=pre_send_iso,
+            )
+
+            if is_last:
+                self._send_last_ts = pre_send_wall
+                print(f"[+] [{pre_send_iso}] 最后一个 chunk 已发送 (#{self._total_sent_chunks})")
+                self.logger.log({
+                    "event": "send_complete",
+                    "total_chunks": self._total_sent_chunks,
+                    "send_last_timestamp": self._send_last_ts,
+                    "send_last_iso": pre_send_iso,
+                    "send_duration_ms": round((post_send_mono - start_mono) * 1000, 3),
+                })
+
+            chunk_index += 1
+            offset = end
+
+        if jitters:
+            avg_jitter = sum(jitters) / len(jitters)
+            max_jitter = max(jitters, key=abs)
+            min_jitter = min(jitters, key=abs)
+            std_jitter = (sum((j - avg_jitter) ** 2 for j in jitters) / len(jitters)) ** 0.5
+            print(f"\n{'='*60}")
+            print(f"[SEND STATS] 发送抖动统计")
+            print(f"  总 chunk 数 : {len(jitters)}")
+            print(f"  平均抖动    : {avg_jitter:+.3f} ms")
+            print(f"  最小抖动    : {min_jitter:+.3f} ms")
+            print(f"  最大抖动    : {max_jitter:+.3f} ms")
+            print(f"  标准差      : {std_jitter:.3f} ms")
+            print(f"  欠载次数    : {overdue_count} (错过目标时间)")
+            print(f"{'='*60}\n")
+            self._jitter_stats = {
+                "avg_jitter_ms": round(avg_jitter, 3),
+                "min_jitter_ms": round(min_jitter, 3),
+                "max_jitter_ms": round(max_jitter, 3),
+                "std_jitter_ms": round(std_jitter, 3),
+                "overdue_count": overdue_count,
+                "chunk_count": len(jitters),
+            }
+        else:
+            self._jitter_stats = None
+
+        print(f"[+] [{now_iso()}] 音频发送完成，共 {self._total_sent_chunks} 个 chunk")
+
+    async def wait_for_first_response(self, timeout: float = 30.0):
+        print(f"[*] [{now_iso()}] 等待首响 (timeout={timeout}s)...")
+        try:
+            await asyncio.wait_for(self._recv_first_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            print(f"[!] [{now_iso()}] 等待首响超时 ({timeout}s)")
+            return False
 
     async def run(self):
         await self.connect()
-        if self.config.publish_mic:
-            try:
-                await self.publish_microphone()
-            except Exception as e:
-                print(f"[!] 麦克风发布失败: {e}")
-        cfg = self.config
-        print(f"\n[*] 运行中")
-        print(f"    silence_threshold={cfg.silence_threshold}")
-        print(f"    silence_confirmation_frames={cfg.silence_confirmation_frames}")
-        print(f"    min_silence_ms={cfg.min_silence_ms}")
-        print(f"[*] 按 Ctrl+C 退出...")
-        try:
-            while self._running:
-                await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            pass
+        await self.publish_audio_track()
+
+        recv_task = asyncio.create_task(self._recv_loop(), name="recv-loop")
+        await asyncio.sleep(1.0)
+
+        send_task = asyncio.create_task(self.send_audio_file(), name="send-audio")
+        await send_task
+
+        got_response = await self.wait_for_first_response(
+            timeout=self.config.wait_for_remote_timeout
+        )
+
+        if got_response and self._send_last_ts and self._recv_first_ts:
+            latency_ms = (self._recv_first_ts - self._send_last_ts) * 1000.0
+            print(f"\n{'='*60}")
+            print(f"[RESULT] 首响时延: {latency_ms:.3f} ms")
+            print(f"         发送完成: {fmt_ts(self._send_last_ts)}")
+            print(f"         首帧到达: {fmt_ts(self._recv_first_ts)}")
+            print(f"{'='*60}\n")
+            self.logger.log_latency(latency_ms, self._send_last_ts, self._recv_first_ts)
+        else:
+            print(f"[!] [{now_iso()}] 未能计算首响时延")
+
+        print(f"[*] [{now_iso()}] 等待 5 秒收集后续音频...")
+        await asyncio.sleep(5.0)
+        await self.shutdown()
 
     async def shutdown(self):
         if not self._running:
             return
-        print("\n[*] 关闭中...")
+        print(f"\n[*] [{now_iso()}] 关闭中...")
         self._running = False
         for task in self._tasks:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        for sid, player in list(self.audio_players.items()):
-            try:
-                player.stop()
-                player.close()
-            except Exception:
-                pass
-        self.audio_players.clear()
-        self.audio_streams.clear()
-        await self.frame_logger.stop()
+
+        # 保存所有尚未保存的接收音频
+        if self.config.save_recv_audio:
+            for track_sid in list(self._recv_audio_buffers.keys()):
+                if track_sid not in self._recv_audio_saved:
+                    self._save_recv_audio(track_sid)
+
+        jitter_stats = getattr(self, '_jitter_stats', None)
+        self.logger.log_session_end(
+            self._total_sent_chunks, self._recv_total_frames, self._recv_valid_frames,
+            jitter_stats=jitter_stats
+        )
+        await self.logger.stop()
+
         if self.room:
             await self.room.disconnect()
-        print("[+] 已关闭")
+        print(f"[+] [{now_iso()}] 已关闭")
+
+    # ---------- 音频保存工具 ----------
+
+    def _save_recv_audio(self, track_sid: str, participant_identity: str = "unknown"):
+        """将接收到的音频缓冲区保存为 WAV 文件"""
+        if track_sid in self._recv_audio_saved:
+            return
+        self._recv_audio_saved.add(track_sid)
+
+        buffer = self._recv_audio_buffers.get(track_sid)
+        params = self._recv_audio_params.get(track_sid)
+        if not buffer or not params:
+            return
+
+        total_bytes = sum(len(b) for b in buffer)
+        if total_bytes == 0:
+            print(f"[!] [{now_iso()}] 音频缓冲区为空，跳过保存: {track_sid}")
+            return
+
+        # 合并所有音频数据
+        audio_data = b"".join(buffer)
+
+        # 文件名
+        safe_identity = participant_identity.replace("/", "_").replace("\\", "_")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recv_{ts}_{track_sid}_{safe_identity}.wav"
+        filepath = Path(self.config.log_dir) / filename
+
+        try:
+            with wave.open(str(filepath), 'wb') as wf:
+                wf.setnchannels(params["channels"])
+                wf.setsampwidth(params["width"])
+                wf.setframerate(params["sample_rate"])
+                wf.writeframes(audio_data)
+            print(f"[+] [{now_iso()}] 接收音频已保存: {filepath}")
+            print(f"    大小: {total_bytes} bytes, 时长: ~{total_bytes / params['sample_rate'] / params['width'] / params['channels']:.2f}s")
+        except Exception as e:
+            print(f"[!] [{now_iso()}] 保存音频失败 ({track_sid}): {e}")
 
     # ---------- 事件回调 ----------
+
     def _on_connected(self):
-        print("[+] 房间连接成功")
+        print(f"[+] [{now_iso()}] 房间连接成功")
 
     def _on_disconnected(self):
-        print("[-] 房间断开")
+        print(f"[-] [{now_iso()}] 房间断开")
         self._running = False
-
-    def _on_connection_state_changed(self, state: ConnectionState):
-        print(f"[*] 连接状态: {state}")
-
-    def _on_participant_connected(self, participant):
-        print(f"[+] 加入: {participant.identity}")
-
-    def _on_participant_disconnected(self, participant):
-        print(f"[-] 离开: {participant.identity}")
 
     def _on_track_subscribed(self, track: Track, publication: TrackPublication, participant):
         if track.kind != TrackKind.KIND_AUDIO:
             return
-        print(f"[+] 订阅音频: {track.sid} from {participant.identity}")
+        print(f"[+] [{now_iso()}] 订阅音频: {track.sid} from {participant.identity}")
         audio_stream = AudioStream(track)
-        self.audio_streams[track.sid] = audio_stream
-        asyncio.create_task(
-            self._audio_playback_task(track.sid, audio_stream, participant.identity))
+        task = asyncio.create_task(
+            self._audio_recv_task(track.sid, audio_stream, participant.identity),
+            name=f"recv-{track.sid}"
+        )
+        self._tasks.append(task)
 
     def _on_track_unsubscribed(self, track: Track, publication: TrackPublication, participant):
-        print(f"[-] 取消订阅: {track.sid}")
-        if track.sid in self.audio_streams:
-            del self.audio_streams[track.sid]
-        if track.sid in self.audio_players:
-            try:
-                self.audio_players[track.sid].stop()
-                self.audio_players[track.sid].close()
-            except Exception:
-                pass
-            del self.audio_players[track.sid]
+        print(f"[-] [{now_iso()}] 取消订阅: {track.sid}")
+        # 取消订阅时立即保存该 track 的音频
+        if self.config.save_recv_audio and track.sid in self._recv_audio_buffers:
+            self._save_recv_audio(track.sid, participant.identity)
 
-    # ---------- 音频任务（状态机版）----------
-    async def _audio_playback_task(self, track_sid: str, audio_stream: AudioStream, identity: str):
-        print(f"[*] 播放任务启动: {track_sid}")
-        try:
-            first_event = await audio_stream.__anext__()
-        except StopAsyncIteration:
-            print(f"[!] 空流: {track_sid}")
-            return
+    # ---------- 接收任务 ----------
 
-        first_frame = first_event.frame
-        sr = first_frame.sample_rate
-        ch = first_frame.num_channels
-        print(f"[+] 音频参数: {sr}Hz, {ch}ch, 首帧 {len(first_frame.data)} bytes")
+    async def _recv_loop(self):
+        while self._running:
+            await asyncio.sleep(0.5)
 
-        player = sd.OutputStream(samplerate=sr, channels=ch, dtype=np.int16, blocksize=0)
-        player.start()
-        self.audio_players[track_sid] = player
-
-        cfg = self.config
-        await self.frame_logger.log_session_start(
-            track_sid, identity, sr, ch,
-            cfg.silence_threshold, cfg.silence_confirmation_frames, cfg.min_silence_ms
-        )
-
-        # ========== 状态机变量 ==========
-        state = AudioState.IDLE
-        silence_candidate_count = 0
-        silence_start_time = 0.0      # 首次静音帧的时间戳
-        frame_count = 0               # 有效帧计数
-        total_raw_frames = 0          # 原始帧计数
-        start_time = time.time()
-        # =================================
-
-        async def _process_frame(frame: AudioFrame):
-            nonlocal state, silence_candidate_count, silence_start_time
-            nonlocal frame_count, total_raw_frames
-
-            total_raw_frames += 1
-            current_time = time.time()
-            is_silence, peak = is_silence_frame(frame, cfg.silence_threshold)
-
-            # ===== 状态机转换 =====
-            if state == AudioState.IDLE:
-                if not is_silence:
-                    # 首个有效帧
-                    await self.frame_logger.log_first_frame(track_sid, identity, frame, peak)
-                    frame_count += 1
-                    await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
-                    state = AudioState.SPEAKING
-                    print(f"\n{'='*60}")
-                    print(f"[FIRST FRAME] 首个有效音频帧!")
-                    print(f"  Track SID : {track_sid}")
-                    print(f"  From      : {identity}")
-                    print(f"  时间戳(秒) : {current_time:.6f}")
-                    print(f"  ISO 时间   : {datetime.fromtimestamp(current_time).isoformat()}")
-                    print(f"  峰值幅度   : {peak} (threshold={cfg.silence_threshold})")
-                    print(f"{'='*60}\n")
-                # 静音帧在IDLE状态：直接丢弃，不播放，不记录
-                else:
-                    pass
-                self._play_frame(player, frame)
-
-            elif state == AudioState.SPEAKING:
-                if is_silence:
-                    # 进入静音候选
-                    state = AudioState.SILENCE_CANDIDATE
-                    silence_candidate_count = 1
-                    silence_start_time = current_time
-                else:
-                    # 继续说话
-                    frame_count += 1
-                    await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
-                self._play_frame(player, frame)
-
-            elif state == AudioState.SILENCE_CANDIDATE:
-                if is_silence:
-                    silence_candidate_count += 1
-                    if silence_candidate_count >= cfg.silence_confirmation_frames:
-                        # 确认进入静音期
-                        state = AudioState.SILENCE_CONFIRMED
-                        # 可选：打印确认信息
-                        # confirmed_ms = (current_time - silence_start_time) * 1000.0
-                        # print(f"[*] [{track_sid}] 静音确认: {silence_candidate_count}帧 ({confirmed_ms:.1f}ms)")
-                else:
-                    # 短静音，恢复说话（抖动/换气）
-                    state = AudioState.SPEAKING
-                    silence_candidate_count = 0
-                    frame_count += 1
-                    await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
-                    print(f"[*] [{track_sid}] 短静音恢复 ({silence_candidate_count}帧), 视为同一段话")
-                self._play_frame(player, frame)
-
-            elif state == AudioState.SILENCE_CONFIRMED:
-                if not is_silence:
-                    # 从确认静音期恢复
-                    silence_duration_ms = (current_time - silence_start_time) * 1000.0
-                    state = AudioState.SPEAKING
-                    silence_candidate_count = 0
-
-                    if silence_duration_ms >= cfg.min_silence_ms:
-                        # 【核心】静音足够长，触发新 utterance
-                        await self.frame_logger.log_utterance_first_frame(
-                            track_sid, identity, frame, silence_duration_ms, peak)
-                        idx = self.frame_logger._utterance_counter.get(track_sid, 0)
-                        frame_count += 1
-                        await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
-                        print(f"\n{'='*60}")
-                        print(f"[UTTERANCE #{idx}] 新段落开始!")
-                        print(f"  静音期持续: {silence_duration_ms:.1f}ms (阈值={cfg.min_silence_ms}ms)")
-                        print(f"  确认帧数  : {cfg.silence_confirmation_frames}")
-                        print(f"  Track SID : {track_sid}")
-                        print(f"  From      : {identity}")
-                        print(f"  时间戳(秒) : {current_time:.6f}")
-                        print(f"  ISO 时间   : {datetime.fromtimestamp(current_time).isoformat()}")
-                        print(f"  峰值幅度   : {peak}")
-                        print(f"{'='*60}\n")
-                    else:
-                        # 静音太短，视为同一段话继续
-                        frame_count += 1
-                        await self.frame_logger.log_frame(track_sid, identity, frame_count, frame, peak)
-                        print(f"[*] [{track_sid}] 忽略短停顿 (静音{silence_duration_ms:.1f}ms < {cfg.min_silence_ms}ms)")
-                else:
-                    # 继续静音，记录摘要
-                    if silence_candidate_count % 500 == 0:
-                        silence_ms = (current_time - silence_start_time) * 1000.0
-                        await self.frame_logger.log_silence_period(
-                            track_sid, identity, silence_candidate_count, silence_ms)
-                self._play_frame(player, frame)
-
-            # 定期打印进度
-            if frame_count > 0 and frame_count % 100 == 0:
-                elapsed = time.time() - start_time
-                print(f"[{track_sid}] 有效音频 {frame_count} 帧, 运行 {elapsed:.1f}s (原始帧 {total_raw_frames})")
-
-        # 处理首帧
-        await _process_frame(first_frame)
+    async def _audio_recv_task(self, track_sid: str, audio_stream: AudioStream, identity: str):
+        print(f"[*] [{now_iso()}] 接收任务启动: {track_sid}")
+        frame_index = 0
+        state = RecvState.IDLE
+        silence_count = 0
+        silence_start = 0.0
+        first_frame = True
 
         try:
             async for event in audio_stream:
                 if not self._running:
                     break
-                await _process_frame(event.frame)
-        except Exception as e:
-            print(f"[!] 播放异常 ({track_sid}): {e}")
-        finally:
-            total_ms = (time.time() - start_time) * 1000.0
-            print(f"[-] 播放结束: {track_sid}, 有效帧 {frame_count}, 原始帧 {total_raw_frames}, {total_ms:.1f}ms")
-            await self.frame_logger.log_session_end(track_sid, identity, frame_count, total_ms)
-            try:
-                player.stop()
-                player.close()
-            except Exception:
-                pass
-            if track_sid in self.audio_players:
-                del self.audio_players[track_sid]
 
-    def _play_frame(self, player: sd.OutputStream, frame: AudioFrame):
-        audio_data = np.asarray(frame.data, dtype=np.int16)
-        if frame.num_channels > 1:
-            audio_data = audio_data.reshape(-1, frame.num_channels)
-        player.write(audio_data)
+                frame = event.frame
+                self._recv_total_frames += 1
+                frame_index += 1
 
-    async def _microphone_capture_task(self, sample_rate: int, channels: int):
-        blocksize = sample_rate // 50
-        bytes_per_sample = channels * 2
-        overflow_count = 0
-        try:
-            with sd.RawInputStream(
-                samplerate=sample_rate, channels=channels, dtype=np.int16,
-                blocksize=blocksize, latency='low') as stream:
-                print(f"[+] 麦克风启动 (blocksize={blocksize})")
-                for _ in range(5):
-                    stream.read(blocksize)
-                while self._running:
-                    data, overflowed = stream.read(blocksize)
-                    if overflowed:
-                        overflow_count += 1
-                        if overflow_count <= 5:
-                            print(f"[!] 溢出 x{overflow_count}")
+                # 保存音频数据
+                if self.config.save_recv_audio:
+                    # 首帧时记录音频参数
+                    if first_frame:
+                        first_frame = False
+                        self._recv_audio_params[track_sid] = {
+                            "sample_rate": frame.sample_rate,
+                            "channels": frame.num_channels,
+                            "width": 2,  # int16 = 2 bytes
+                        }
+                        self._recv_audio_buffers[track_sid] = []
+                        print(f"    [{now_iso()}] 开始缓存接收音频: {track_sid} "
+                              f"({frame.sample_rate}Hz, {frame.num_channels}ch)")
+
+                    # 将 frame data 转为 bytes 追加到缓冲区
+                    if hasattr(frame.data, "tobytes"):
+                        self._recv_audio_buffers[track_sid].append(frame.data.tobytes())
+                    elif isinstance(frame.data, (bytes, bytearray)):
+                        self._recv_audio_buffers[track_sid].append(bytes(frame.data))
                     else:
-                        overflow_count = 0
-                    audio_bytes = bytes(data)
-                    frame = AudioFrame(
-                        data=audio_bytes, sample_rate=sample_rate,
-                        num_channels=channels,
-                        samples_per_channel=len(audio_bytes) // bytes_per_sample)
-                    await self.local_audio_source.capture_frame(frame)
-                    await asyncio.sleep(0)
+                        # 其他类型（如 memoryview），用 numpy 转
+                        arr = np.asarray(frame.data, dtype=np.int16)
+                        self._recv_audio_buffers[track_sid].append(arr.tobytes())
+
+                is_silence, peak = is_silence_frame(frame, self.config.silence_threshold)
+
+                if state == RecvState.IDLE:
+                    if is_silence:
+                        silence_count += 1
+                        if silence_count == 1:
+                            silence_start = time.time()
+                    else:
+                        state = RecvState.SPEAKING
+                        self._recv_first_ts = time.time()
+                        self._recv_valid_frames += 1
+                        silence_duration = (self._recv_first_ts - silence_start) * 1000.0 if silence_count > 0 else 0.0
+                        recv_iso = fmt_ts(self._recv_first_ts)
+
+                        print(f"\n{'='*60}")
+                        print(f"[FIRST VALID] 首响音频帧!")
+                        print(f"  Track SID : {track_sid}")
+                        print(f"  From      : {identity}")
+                        print(f"  帧序号    : {frame_index}")
+                        print(f"  峰值幅度  : {peak}")
+                        print(f"  时间戳    : {recv_iso}")
+                        print(f"  前置静音  : {silence_count} 帧 ({silence_duration:.1f}ms)")
+                        print(f"{'='*60}\n")
+
+                        self.logger.log_first_valid_frame(
+                            track_sid, frame_index, peak, silence_count, silence_duration
+                        )
+                        self._recv_first_event.set()
+
+                        if self._send_last_ts and not self._latency_measured:
+                            self._latency_measured = True
+                            latency_ms = (self._recv_first_ts - self._send_last_ts) * 1000.0
+                            print(f"[LATENCY] 首响时延: {latency_ms:.3f} ms")
+                            self.logger.log_latency(
+                                latency_ms, self._send_last_ts, self._recv_first_ts
+                            )
+
+                        self.logger.log_recv_frame(
+                            track_sid, frame_index, peak, False, True
+                        )
+
+                elif state == RecvState.SPEAKING:
+                    if not is_silence:
+                        self._recv_valid_frames += 1
+                    self.logger.log_recv_frame(
+                        track_sid, frame_index, peak, is_silence, False
+                    )
+
+                if frame_index % 100 == 0:
+                    print(f"[{now_iso()}] [{track_sid}] 已接收 {frame_index} 帧, 有效 {self._recv_valid_frames} 帧")
+
         except Exception as e:
-            print(f"[!] 麦克风异常: {e}")
+            print(f"[!] [{now_iso()}] 接收异常 ({track_sid}): {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            print(f"[-] [{now_iso()}] 接收结束: {track_sid}, 总帧 {frame_index}, 有效 {self._recv_valid_frames}")
+            # 任务结束时保存音频（如果尚未保存）
+            if self.config.save_recv_audio and track.sid in self._recv_audio_buffers:
+                self._save_recv_audio(track_sid, identity)
 
 
 # ========================== 入口 ==========================
@@ -666,16 +723,18 @@ async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", "-c", default="config.json")
     args = parser.parse_args()
+
     try:
         config = Config.from_json(args.config)
     except Exception as e:
-        print(f"[x] 配置错误: {e}")
+        print(f"[x] [{now_iso()}] 配置错误: {e}")
         sys.exit(1)
-    client = LiveKitClient(config)
+
+    client = EvalClient(config)
     loop = asyncio.get_running_loop()
 
     def _signal_handler(sig):
-        print(f"\n[!] 信号 {sig.name}")
+        print(f"\n[!] [{now_iso()}] 信号 {sig.name}")
         asyncio.create_task(client.shutdown())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -683,9 +742,11 @@ async def main():
             loop.add_signal_handler(sig, lambda s=sig: _signal_handler(s))
         except NotImplementedError:
             pass
+
     if sys.platform == "win32":
         signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(client.shutdown()))
         signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(client.shutdown()))
+
     try:
         await client.run()
     except KeyboardInterrupt:
