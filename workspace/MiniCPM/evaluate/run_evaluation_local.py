@@ -241,7 +241,6 @@ class MiniCPMOLocalInference:
         )
         self.model.eval()
 
-        # 将 chunk_ms 传入 duplex_config，让 DuplexCapability 内部使用
         self.model.init_unified(
             pt_path=None,
             chat_vocoder="token2wav",
@@ -249,7 +248,7 @@ class MiniCPMOLocalInference:
             duplex_config={
                 "max_new_speak_tokens_per_chunk": self.max_speak_tokens,
                 "chunk_ms": self.chunk_ms,
-                "first_chunk_ms": self.chunk_ms + 35,  # 与源码对齐，first_chunk 略长
+                "first_chunk_ms": self.chunk_ms + 35,
             },
             device=device,
         )
@@ -276,15 +275,14 @@ class MiniCPMOLocalInference:
     ):
         """
         全双工流式推理。
-        输入音频完整 chunk-by-chunk，不截断。
-        若 realtime=True，每处理完一个 chunk 会 sleep 到与真实时间对齐。
+        所有真实音频 chunk 强制输完，无论模型是否提前 end_of_turn。
         """
         import torch
 
         # ── 1. 加载输入音频（完整，不截断） ──
         audio_input, sr = librosa.load(audio_path, sr=16000, mono=True)
         audio_duration_ms = len(audio_input) / sr * 1000
-        logger.info(f"[Input] Loaded {len(audio_input)} samples ({audio_duration_ms/1000:.1f}s) — NOT truncated")
+        logger.info(f"[Input] Loaded {len(audio_input)} samples ({audio_duration_ms/1000:.2f}s) — NOT truncated")
 
         # ── 2. 准备参考音色（TTS voice clone） ──
         if ref_audio_path and os.path.exists(ref_audio_path):
@@ -310,25 +308,21 @@ class MiniCPMOLocalInference:
         # ── 3. 设置全双工模式 ──
         self.model.set_mode(self.ProcessorMode.DUPLEX)
 
-        # ── 关键修正：prefix/suffix 严格与 infer_debug.py 一致 ──
-        # 错误示范（之前）：prefix = f"||<<||<|im_start|>system..."  ← 多了 ||<< 导致 tokenizer 无法识别特殊 token
-        # 正确格式（如下）：纯字符串，让 tokenizer 正确识别 <|im_start|> 等特殊 token
-        prefix = f"<|im_start|>system\n{system_prompt}\n<|audio_start|>"
-        suffix = "<|audio_end|>"
+        prefix = f"||<<||<|im_start|>system\n{system_prompt}\n<<||<<||<|audio_start|>"
+        suffix = "||<<||<|audio_end|>"
 
-        full_prompt = self.model.duplex_prepare(
+        self.model.duplex_prepare(
             prefix_system_prompt=prefix,
             suffix_system_prompt=suffix,
             ref_audio=ref_audio,
             prompt_wav_path=prompt_wav_path,
         )
-        logger.info(f"[Duplex] System prompt prepared")
 
-        # ── 4. 对完整输入音频进行 chunk-by-chunk 处理 ──
-        chunk_size = int(self.chunk_ms * sr / 1000)  # 根据 chunk_ms 动态计算
+        # ── 4. 对完整输入音频进行 chunk-by-chunk 处理（强制全部输完） ──
+        chunk_size = int(self.chunk_ms * sr / 1000)
         total_len = len(audio_input)
         num_real_chunks = (total_len + chunk_size - 1) // chunk_size
-        logger.info(f"[Duplex] Processing {num_real_chunks} chunks ({self.chunk_ms}ms/chunk) from {audio_duration_ms/1000:.1f}s audio")
+        logger.info(f"[Duplex] Audio length={audio_duration_ms/1000:.2f}s, total_chunks={num_real_chunks}")
 
         unit_records = []
         all_speak_texts = []
@@ -337,8 +331,9 @@ class MiniCPMOLocalInference:
         # 计时
         infer_start = time.perf_counter()
         first_speak_time_ms = None
+        turn_ended = False  # 标记是否已 end_of_turn，但不 break
 
-        # 处理所有真实音频 chunk
+        # 处理所有真实音频 chunk —— 无论模型是否提前 end_of_turn，全部输完
         for i in range(num_real_chunks):
             chunk_start = i * chunk_size
             chunk_end = min((i + 1) * chunk_size, total_len)
@@ -346,32 +341,32 @@ class MiniCPMOLocalInference:
             if len(chunk) < chunk_size:
                 chunk = np.pad(chunk, (0, chunk_size - len(chunk)), mode="constant")
 
-            # 处理 chunk（内部会计时）
             gen_res = self._process_chunk(
                 i, chunk, chunk_start, chunk_end,
                 unit_records, all_speak_texts, all_audio_chunks,
                 is_silence=False,
             )
 
-            # 记录首次 SPEAK
+            # 记录首次 SPEAK（从音频开始算）
             if first_speak_time_ms is None and not gen_res['is_listen']:
                 first_speak_time_ms = (time.perf_counter() - infer_start) * 1000
-                logger.info(f"\n*** FIRST SPEAK at chunk {i}: {first_speak_time_ms:.0f}ms from audio start ***")
+                logger.info(f"\n*** FIRST SPEAK at chunk {i}/{num_real_chunks}: {first_speak_time_ms:.0f}ms ***")
 
-            # ── 实时模拟：如果处理太快，sleep 到与真实时间对齐 ──
-            if self.realtime and i < num_real_chunks - 1:  # 最后一个 chunk 不需要等
-                expected_time = (i + 1) * self.chunk_ms / 1000.0  # 当前应该消耗的真实时间
+            # 记录 end_of_turn，但不 break，继续输完剩余音频
+            if gen_res['end_of_turn'] and not turn_ended:
+                turn_ended = True
+                logger.info(f"[Duplex] Turn ended at chunk {i}/{num_real_chunks}, but continuing remaining audio...")
+
+            # 实时模拟
+            if self.realtime and i < num_real_chunks - 1:
+                expected_time = (i + 1) * self.chunk_ms / 1000.0
                 elapsed = time.perf_counter() - infer_start
                 if elapsed < expected_time:
                     sleep_time = expected_time - elapsed
-                    logger.info(f"[Realtime] Sleep {sleep_time:.3f}s to align with chunk {i+1}")
+                    logger.info(f"[Realtime] Sleep {sleep_time:.3f}s to align with chunk {i+1}/{num_real_chunks}")
                     time.sleep(sleep_time)
 
-            if gen_res['end_of_turn']:
-                logger.info(f"[Duplex] Turn ended at real chunk {i}")
-                break
-
-        # ── 5. 静音推进 ──
+        # ── 5. 静音推进（所有真实音频输完后，若模型仍在 SPEAK） ──
         last_chunk_was_speak = (
             unit_records and not unit_records[-1]['is_listen']
             and not unit_records[-1]['end_of_turn']
@@ -380,7 +375,7 @@ class MiniCPMOLocalInference:
         if last_chunk_was_speak:
             max_silence_chunks = 10
             silence_chunk = np.zeros(chunk_size, dtype=np.float32)
-            logger.info(f"\n[Duplex] Audio ended but model still SPEAK — silence push mode (max {max_silence_chunks})")
+            logger.info(f"\n[Duplex] All {num_real_chunks} chunks fed. Model still SPEAK — silence push mode (max {max_silence_chunks})")
 
             silence_idx = 0
             while last_chunk_was_speak and silence_idx < max_silence_chunks:
@@ -422,6 +417,9 @@ class MiniCPMOLocalInference:
         print(f"\n{'='*60}")
         print(f"[Duplex Result] text='{full_text[:80]}...'")
         print(f"[Duplex Result] speak_segments={len(all_speak_texts)} audio_chunks={len(all_audio_chunks)}")
+        listen_count = sum(1 for u in unit_records if u['is_listen'])
+        speak_count = len(unit_records) - listen_count
+        print(f"[Duplex Result] chunk_summary: LISTEN={listen_count} SPEAK={speak_count} TOTAL={len(unit_records)}")
         if first_speak_time_ms is not None:
             print(f"[Duplex Result] FIRST_RESPONSE (from start): {first_speak_time_ms:.0f}ms")
             print(f"[Duplex Result] FIRST_RESPONSE (from end):   {first_response_from_end_ms:.0f}ms")
@@ -449,6 +447,7 @@ class MiniCPMOLocalInference:
             "first_response_from_start_ms": first_speak_time_ms,
             "first_response_from_end_ms": first_response_from_end_ms,
             "audio_duration_ms": audio_duration_ms,
+            "unit_records": unit_records,
         }
 
     def _process_chunk(
@@ -505,7 +504,7 @@ class MiniCPMOLocalInference:
             f"audio={audio_info:18s} cost={chunk_elapsed_ms:6.1f}ms"
         )
 
-        # 5. 收集音频和文本 —— 完全参照 infer_debug.py
+        # 5. 收集音频和文本
         if not is_listen and gen_res.get('audio_waveform') is not None:
             waveform = gen_res['audio_waveform']
             if isinstance(waveform, torch.Tensor):
@@ -514,13 +513,14 @@ class MiniCPMOLocalInference:
             if text:
                 all_speak_texts.append(text)
 
-        # 6. 记录
+        # 6. 记录 chunk 状态
         unit_records.append({
             "chunk_idx": chunk_idx,
             "is_silence": is_silence,
             "is_listen": is_listen,
             "end_of_turn": gen_res['end_of_turn'],
             "text": text,
+            "has_audio": gen_res.get('audio_waveform') is not None,
         })
 
         return gen_res
@@ -596,6 +596,9 @@ def process_single(
         result["latency_ms"] = round(infer_result["latency_ms"], 1)
         result["first_response_from_start_ms"] = round(infer_result.get("first_response_from_start_ms"), 1) if infer_result.get("first_response_from_start_ms") is not None else None
         result["first_response_from_end_ms"] = round(infer_result.get("first_response_from_end_ms"), 1) if infer_result.get("first_response_from_end_ms") is not None else None
+
+        # 保存每个 chunk 的决策状态
+        result["chunk_records"] = infer_result.get("unit_records", [])
 
         # 保存音频
         if waveform is not None:
