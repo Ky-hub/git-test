@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LiveKit 实时交互模拟评测脚本（Ctrl+C 手动控制关闭版）
+LiveKit 实时交互模拟评测脚本（带 utterance 结束检测版）
 """
 
 import argparse
@@ -25,7 +25,6 @@ from livekit.rtc import (
     AudioStream, AudioFrame, AudioSource, LocalAudioTrack,
 )
 
-# Windows 提升定时器精度到 1ms
 if sys.platform == "win32":
     import ctypes
     ctypes.windll.winmm.timeBeginPeriod(1)
@@ -46,6 +45,7 @@ class Config:
         self.channels = data.get("channels", 1)
         self.silence_threshold = data.get("silence_threshold", 100)
         self.silence_confirmation_frames = data.get("silence_confirmation_frames", 30)
+        self.min_silence_ms = data.get("min_silence_ms", 800)
         self.log_dir = data.get("log_dir", "./eval_logs")
         self.save_recv_audio = data.get("save_recv_audio", True)
         self.wait_for_remote_timeout = data.get("wait_for_remote_timeout", 30.0)
@@ -217,6 +217,18 @@ class EvalLogger:
             "silence_duration_ms": round(silence_duration_ms, 3),
         })
 
+    def log_utterance_end(self, track_sid: str, frame_index: int,
+                          silence_frames: int, silence_duration_ms: float,
+                          utterance_duration_ms: float):
+        self.log({
+            "event": "utterance_end",
+            "track_sid": track_sid,
+            "frame_index": frame_index,
+            "silence_frames": silence_frames,
+            "silence_duration_ms": round(silence_duration_ms, 3),
+            "utterance_duration_ms": round(utterance_duration_ms, 3),
+        })
+
     def log_latency(self, first_response_latency_ms: float,
                     send_last_ts: float, recv_first_ts: float):
         self.log({
@@ -245,9 +257,10 @@ class EvalLogger:
 # ========================== 状态机 ==========================
 
 class RecvState(Enum):
-    IDLE = auto()
-    SILENCE_CANDIDATE = auto()
-    SPEAKING = auto()
+    IDLE = auto()              # 尚未收到有效音频
+    SPEAKING = auto()          # 正在接收有效音频
+    SILENCE_CANDIDATE = auto() # 出现静音帧，候选中（可能短暂停顿）
+    SPEAKING_ENDED = auto()    # 已确认 utterance 结束（静音足够长）
 
 
 # ========================== 客户端核心 ==========================
@@ -262,25 +275,20 @@ class EvalClient:
         self.audio_track: Optional[LocalAudioTrack] = None
         self.logger = EvalLogger(config.log_dir, config.agent_name)
 
-        # 发送相关
         self._send_last_ts: Optional[float] = None
         self._total_sent_chunks = 0
 
-        # 接收相关
         self._recv_first_ts: Optional[float] = None
         self._recv_total_frames = 0
         self._recv_valid_frames = 0
         self._latency_measured = False
-        self._recv_state = RecvState.IDLE
         self._recv_silence_count = 0
         self._recv_silence_start = 0.0
 
-        # 音频保存相关
         self._recv_audio_buffers: Dict[str, List[bytes]] = {}
         self._recv_audio_params: Dict[str, dict] = {}
         self._recv_audio_saved: set = set()
 
-        # 同步原语
         self._recv_first_event = asyncio.Event()
 
     async def connect(self):
@@ -312,7 +320,6 @@ class EvalClient:
         print(f"[+] [{now_iso()}] 音频轨道已发布, sid={publication.sid}")
 
     async def send_audio_file(self):
-        """读取 WAV 文件并分 chunk 模拟实时发送（零阻塞版）"""
         cfg = self.config
         audio_path = Path(cfg.audio_file)
         if not audio_path.exists():
@@ -497,7 +504,6 @@ class EvalClient:
         send_task = asyncio.create_task(self.send_audio_file(), name="send-audio")
         await send_task
 
-        # 等待首响（收到或超时）
         got_response = await self.wait_for_first_response(
             timeout=self.config.wait_for_remote_timeout
         )
@@ -513,7 +519,6 @@ class EvalClient:
         else:
             print(f"[!] [{now_iso()}] 未能计算首响时延")
 
-        # ========== 关键改动：发送完成后持续收集，直到 Ctrl+C ==========
         print(f"\n[*] [{now_iso()}] 发送完成，持续接收远端音频中...")
         print(f"    按 Ctrl+C 停止并保存音频\n")
         try:
@@ -522,8 +527,6 @@ class EvalClient:
         except asyncio.CancelledError:
             pass
 
-        # 这里不会自动执行，因为 while 循环只在 _running=False 时退出
-        # 而 _running=False 由 shutdown() 设置，shutdown() 会在退出时保存音频
         await self.shutdown()
 
     async def shutdown(self):
@@ -537,7 +540,6 @@ class EvalClient:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-        # 保存所有尚未保存的接收音频
         if self.config.save_recv_audio:
             for track_sid in list(self._recv_audio_buffers.keys()):
                 if track_sid not in self._recv_audio_saved:
@@ -615,7 +617,7 @@ class EvalClient:
         if self.config.save_recv_audio and track.sid in self._recv_audio_buffers:
             self._save_recv_audio(track.sid, participant.identity)
 
-    # ---------- 接收任务 ----------
+    # ---------- 接收任务（带结束检测）----------
 
     async def _recv_loop(self):
         while self._running:
@@ -628,6 +630,7 @@ class EvalClient:
         silence_count = 0
         silence_start = 0.0
         first_frame = True
+        utterance_start_ts = 0.0  # 记录当前 utterance 开始时间
 
         try:
             async for event in audio_stream:
@@ -661,20 +664,23 @@ class EvalClient:
 
                 is_silence, peak = is_silence_frame(frame, self.config.silence_threshold)
 
+                # ========== 状态机：开始 + 结束检测 ==========
                 if state == RecvState.IDLE:
                     if is_silence:
                         silence_count += 1
                         if silence_count == 1:
                             silence_start = time.time()
                     else:
+                        # 首个有效帧！utterance 开始
                         state = RecvState.SPEAKING
+                        utterance_start_ts = time.time()
                         self._recv_first_ts = time.time()
                         self._recv_valid_frames += 1
                         silence_duration = (self._recv_first_ts - silence_start) * 1000.0 if silence_count > 0 else 0.0
                         recv_iso = fmt_ts(self._recv_first_ts)
 
                         print(f"\n{'='*60}")
-                        print(f"[FIRST VALID] 首响音频帧!")
+                        print(f"[UTTERANCE START] 首响音频帧!")
                         print(f"  Track SID : {track_sid}")
                         print(f"  From      : {identity}")
                         print(f"  帧序号    : {frame_index}")
@@ -701,14 +707,79 @@ class EvalClient:
                         )
 
                 elif state == RecvState.SPEAKING:
-                    if not is_silence:
+                    if is_silence:
+                        # 出现静音，进入候选状态
+                        state = RecvState.SILENCE_CANDIDATE
+                        silence_count = 1
+                        silence_start = time.time()
+                    else:
+                        # 继续说话
                         self._recv_valid_frames += 1
-                    self.logger.log_recv_frame(
-                        track_sid, frame_index, peak, is_silence, False
-                    )
+                        self.logger.log_recv_frame(
+                            track_sid, frame_index, peak, False, False
+                        )
+
+                elif state == RecvState.SILENCE_CANDIDATE:
+                    if is_silence:
+                        silence_count += 1
+                        silence_duration_ms = (time.time() - silence_start) * 1000.0
+
+                        # 核心：静音帧数达标 且 持续时间超过阈值，确认结束
+                        if (silence_count >= self.config.silence_confirmation_frames and
+                                silence_duration_ms >= self.config.min_silence_ms):
+                            # utterance 确认结束
+                            utterance_duration_ms = (time.time() - utterance_start_ts) * 1000.0
+                            state = RecvState.SPEAKING_ENDED
+
+                            print(f"\n{'='*60}")
+                            print(f"[UTTERANCE END] 说话结束!")
+                            print(f"  Track SID       : {track_sid}")
+                            print(f"  结束帧序号      : {frame_index}")
+                            print(f"  静音确认帧数    : {silence_count}")
+                            print(f"  静音持续时间    : {silence_duration_ms:.1f}ms")
+                            print(f"  本段 utterance  : {utterance_duration_ms:.1f}ms")
+                            print(f"{'='*60}\n")
+
+                            self.logger.log_utterance_end(
+                                track_sid, frame_index, silence_count,
+                                silence_duration_ms, utterance_duration_ms
+                            )
+
+                            # 【可选】在这里触发分段保存
+                            # 如果需要按 utterance 分段保存音频，可以在这里调用保存逻辑
+                            # self._save_recv_audio(track_sid, identity)
+                            # 注意：保存后需要清空 buffer 才能开始下一段
+
+                    else:
+                        # 短静音恢复，继续说话
+                        print(f"[*] [{track_sid}] 短静音恢复 ({silence_count}帧), 视为同一段话")
+                        state = RecvState.SPEAKING
+                        silence_count = 0
+                        self._recv_valid_frames += 1
+                        self.logger.log_recv_frame(
+                            track_sid, frame_index, peak, False, False
+                        )
+
+                elif state == RecvState.SPEAKING_ENDED:
+                    # 已经确认结束，后续帧继续接收但不计入有效帧
+                    # 如果又出现非静音，可以视为新 utterance 开始
+                    if not is_silence:
+                        print(f"\n[NEW UTTERANCE] 检测到新的说话段落!")
+                        state = RecvState.SPEAKING
+                        utterance_start_ts = time.time()
+                        self._recv_valid_frames += 1
+                        silence_count = 0
+                        self.logger.log_recv_frame(
+                            track_sid, frame_index, peak, False, True
+                        )
+                    else:
+                        self.logger.log_recv_frame(
+                            track_sid, frame_index, peak, True, False
+                        )
 
                 if frame_index % 100 == 0:
-                    print(f"[{now_iso()}] [{track_sid}] 已接收 {frame_index} 帧, 有效 {self._recv_valid_frames} 帧")
+                    state_str = state.name
+                    print(f"[{now_iso()}] [{track_sid}] 帧{frame_index} 状态{state_str} 有效{self._recv_valid_frames}")
 
         except Exception as e:
             print(f"[!] [{now_iso()}] 接收异常 ({track_sid}): {e}")
@@ -755,7 +826,6 @@ async def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # 确保 shutdown 被调用（如果信号处理已经调用了，这里会检查 _running 直接返回）
         await client.shutdown()
 
 
