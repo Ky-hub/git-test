@@ -4,15 +4,17 @@ scheduler.py
 全双工评测系统 · 调度模块
 
 职责：运行在全双工交互循环中，输入模型回复 chunk，输出要发送给模型的 chunk。
-只依赖 format.py 的数据类，不直接解析 JSON。
-
-核心设计：
-  - 状态机：SchedulerState 控制生命周期
-  - 策略模式：每种 Transition 对应一个 TransitionHandler
-  - 全双工并发：PLAYING_TURN 状态下，用户音频与模型回复允许同时存在
+所有音频资源（Turn 音频、环境音、静音）均通过 AudioLibrary 获取，且已切成固定大小。
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_FILE_DIR = Path(__file__).resolve().parent
+if str(_FILE_DIR) not in sys.path:
+    sys.path.insert(0, str(_FILE_DIR))
 
 import time
 import enum
@@ -21,25 +23,23 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Callable, Any
 from abc import ABC, abstractmethod
 
-import sys
-from pathlib import Path
-
-# 将本文件所在目录加入 sys.path，确保能找到同级的 format.py
-_FILE_DIR = Path(__file__).resolve().parent
-if str(_FILE_DIR) not in sys.path:
-    sys.path.insert(0, str(_FILE_DIR))
-
 from format import (
-    Chunk, ModelOutputChunk, Scenario, Turn, Transition,
-    FixedTransition, ReactiveTransition, GlobalConfig,
-    Content, Processing, Expected, TextExpectation,
-    AudioExpectation, Action,
+    Chunk,
+    ModelOutputChunk,
+    Scenario,
+    Turn,
+    Transition,
+    FixedTransition,
+    ReactiveTransition,
+    GlobalConfig,
+    Content,
+    Processing,
+    Expected,
+    TextExpectation,
+    AudioExpectation,
+    Action,
+    AudioLibrary,
 )
-
-import json
-import argparse
-
-
 
 
 # ============================================================
@@ -48,26 +48,19 @@ import argparse
 
 class SchedulerState(enum.Enum):
     IDLE = "idle"
-    PLAYING_TURN = "playing_turn"                       # 正在发送当前 Turn 的音频
-    WAITING_MODEL_RESPONSE = "waiting_model_response"   # 等待模型开始回复
-    WAITING_MODEL_SILENCE = "waiting_model_silence"     # 模型回复中，等待静默
-    TRANSITIONING = "transitioning"                       # 执行过渡（固定静音/环境音）
-    INTERRUPTING = "interrupting"                         # 正在发送打断音频
+    PLAYING_TURN = "playing_turn"
+    WAITING_MODEL_RESPONSE = "waiting_model_response"
+    WAITING_MODEL_SILENCE = "waiting_model_silence"
+    TRANSITIONING = "transitioning"
+    INTERRUPTING = "interrupting"
     FINISHED = "finished"
 
 
 # ============================================================
-# 2. Transition 策略处理器（策略模式）
+# 2. Transition 策略处理器
 # ============================================================
 
 class TransitionHandler(ABC):
-    """
-    每种 Transition 类型对应一个处理器。
-    负责两件事：
-      1. should_advance: 根据当前状态与模型 chunk，判断是否进入下一轮
-      2. get_transition_audio: 获取过渡阶段需要发送的音频 chunk
-    """
-
     @abstractmethod
     def should_advance(
         self,
@@ -82,7 +75,7 @@ class TransitionHandler(ABC):
 
 
 class FixedSilenceHandler(TransitionHandler):
-    """fixed + silence: 插入固定时长静音"""
+    """fixed + silence: 通过 AudioLibrary 生成固定大小的静音 chunk"""
 
     def __init__(self, duration_ms: int):
         self.duration_ms = duration_ms
@@ -93,11 +86,12 @@ class FixedSilenceHandler(TransitionHandler):
 
     def get_transition_audio(self, scheduler) -> List[Chunk]:
         self._sent = True
-        return [Chunk.silence(self.duration_ms, source="fixed_silence")]
+        # 通过音频库生成，返回的已是固定大小的 chunk 列表
+        return scheduler.audio_library.generate_silence(self.duration_ms)
 
 
 class FixedAmbientHandler(TransitionHandler):
-    """fixed + ambient: 插入固定时长环境音"""
+    """fixed + ambient: 通过 AudioLibrary 加载环境音并切成固定大小"""
 
     def __init__(self, clip_id: str, duration_ms: int, volume_db: float = 0.0):
         self.clip_id = clip_id
@@ -110,22 +104,12 @@ class FixedAmbientHandler(TransitionHandler):
 
     def get_transition_audio(self, scheduler) -> List[Chunk]:
         self._sent = True
-        return [
-            Chunk.control(
-                "request_ambient",
-                {
-                    "clip_id": self.clip_id,
-                    "duration_ms": self.duration_ms,
-                    "volume_db": self.volume_db,
-                },
-                source="fixed_ambient",
-            )
-        ]
+        return scheduler.audio_library.load_ambient_audio(
+            self.clip_id, self.duration_ms, self.volume_db
+        )
 
 
 class FixedSeamlessHandler(TransitionHandler):
-    """fixed + seamless: 无过渡，立即衔接"""
-
     def should_advance(self, scheduler, model_chunk=None) -> bool:
         return True
 
@@ -134,11 +118,6 @@ class FixedSeamlessHandler(TransitionHandler):
 
 
 class ReactiveAfterModelSpeechHandler(TransitionHandler):
-    """
-    reactive + after_model_speech
-    基于输入的模型音频 chunk 做 VAD 静音累积检测。
-    """
-
     def __init__(self, silence_threshold_ms: int):
         self.silence_threshold_ms = silence_threshold_ms
         self._silence_accumulated_ms = 0.0
@@ -148,7 +127,6 @@ class ReactiveAfterModelSpeechHandler(TransitionHandler):
         if model_chunk is None:
             return False
 
-        # 检测模型开始说话
         if model_chunk.type == "audio" and model_chunk.is_speech is True:
             self._model_started = True
             self._silence_accumulated_ms = 0.0
@@ -159,7 +137,6 @@ class ReactiveAfterModelSpeechHandler(TransitionHandler):
             self._silence_accumulated_ms = 0.0
             return False
 
-        # 累积静默
         if self._model_started:
             is_silence = (
                 (model_chunk.type == "audio" and model_chunk.is_speech is False)
@@ -179,15 +156,10 @@ class ReactiveAfterModelSpeechHandler(TransitionHandler):
 
 
 class ReactiveAfterModelSpeechPlusHandler(TransitionHandler):
-    """
-    reactive + after_model_speech_plus
-    静默阈值满足后，再额外等待 post_silence_wait_ms。
-    """
-
     def __init__(self, silence_threshold_ms: int, post_silence_wait_ms: int):
         self.base_handler = ReactiveAfterModelSpeechHandler(silence_threshold_ms)
         self.post_silence_wait_ms = post_silence_wait_ms
-        self._phase = "waiting_silence"  # waiting_silence -> waiting_post -> ready
+        self._phase = "waiting_silence"
         self._post_wait_start = 0.0
 
     def should_advance(self, scheduler, model_chunk=None) -> bool:
@@ -208,11 +180,6 @@ class ReactiveAfterModelSpeechPlusHandler(TransitionHandler):
 
 
 class ReactiveFixedDelayInterruptHandler(TransitionHandler):
-    """
-    reactive + fixed_delay_interrupt
-    从模型开始回复起，经过固定时间后强制打断。
-    """
-
     def __init__(self, inject_after_model_start_ms: int):
         self.inject_after_model_start_ms = inject_after_model_start_ms
         self._model_start_time_ms: Optional[float] = None
@@ -221,7 +188,6 @@ class ReactiveFixedDelayInterruptHandler(TransitionHandler):
         if model_chunk is None:
             return False
 
-        # 检测模型开始回复
         if self._model_start_time_ms is None:
             is_start = (
                 (model_chunk.type == "audio" and model_chunk.is_speech is True)
@@ -242,8 +208,6 @@ class ReactiveFixedDelayInterruptHandler(TransitionHandler):
 
 
 class ReactiveImmediateHandler(TransitionHandler):
-    """reactive + immediate: 当前轮次播放完毕立即触发"""
-
     def should_advance(self, scheduler, model_chunk=None) -> bool:
         return True
 
@@ -256,16 +220,13 @@ class ReactiveImmediateHandler(TransitionHandler):
 # ============================================================
 
 class TurnScheduler:
-    """
-    全双工交互调度器。
-
-    生命周期：
-      1. load_scenario()    — 加载剧本并预注册音频
-      2. on_model_chunk()   — 全双工循环中每收到模型 chunk 调用
-      3. output_queue       — 异步消费要发送给模型的 chunk
-    """
-
-    def __init__(self):
+    def __init__(self, audio_library: AudioLibrary):
+        """
+        Args:
+            audio_library: 音频资源库接口，负责所有音频资源的加载与固定大小切割。
+        """
+        self.audio_library = audio_library
+        
         self.state = SchedulerState.IDLE
         self.current_turn_idx = -1
         self.scenario: Optional[Scenario] = None
@@ -275,63 +236,42 @@ class TurnScheduler:
         self._turn_audio_queues: Dict[int, queue.Queue] = {}
         self._current_turn_audio_remaining: List[Chunk] = []
 
-        # 输出缓冲
         self.output_queue: queue.Queue = queue.Queue()
 
-        # 打断
         self._interrupt_audio_queue: queue.Queue = queue.Queue()
         self._is_interrupting = False
 
-        # 统计
         self.stats = {
             "turn_start_times": {},
             "model_first_response_times": {},
             "interruptions": [],
         }
 
-    # ---------------------------------------------------------
-    # 剧本加载
-    # ---------------------------------------------------------
-    def load_scenario(
-        self,
-        scenario: Scenario,
-        audio_provider: Callable[[int, Turn], List[Chunk]],
-    ) -> None:
+    def load_scenario(self, scenario: Scenario) -> None:
         """
-        加载剧本，并通过 audio_provider 回调预加载各 Turn 的音频 chunk。
-
-        Args:
-            scenario: 已校验的 Scenario 对象
-            audio_provider: 接收 (turn_idx, turn) 返回 List[Chunk]
+        加载剧本，并通过 AudioLibrary 预加载所有音频资源。
+        所有音频（Turn 内容、后续可能用到的环境音）在此阶段切成固定 chunk。
         """
         self.scenario = scenario
         self.turns = scenario.turns
         self.state = SchedulerState.IDLE
         self.current_turn_idx = -1
 
-        # 预加载所有 Turn 音频
+        # 通过 AudioLibrary 加载每个 Turn 的音频（已切成固定大小）
         for idx, turn in enumerate(self.turns):
-            chunks = audio_provider(idx, turn)
+            chunks = self.audio_library.load_turn_audio(turn)
             q = queue.Queue()
             for c in chunks:
                 q.put(c)
             self._turn_audio_queues[idx] = q
 
-        # 初始静音
+        # 初始静音（同样走 AudioLibrary，切成固定 chunk）
         initial_silence = scenario.global_config.initial_silence_ms
         if initial_silence > 0:
-            self.output_queue.put(Chunk.silence(initial_silence, source="initial_silence"))
+            for c in self.audio_library.generate_silence(initial_silence):
+                self.output_queue.put(c)
 
-    # ---------------------------------------------------------
-    # 主入口：处理模型输入 chunk
-    # ---------------------------------------------------------
     def on_model_chunk(self, model_chunk: ModelOutputChunk) -> List[Chunk]:
-        """
-        全双工循环核心入口。
-
-        返回: 本次调度决策产生的、需要立即发送给模型的 chunk 列表。
-              这些 chunk 也会被追加到内部 output_queue。
-        """
         output_chunks: List[Chunk] = []
 
         if self.state == SchedulerState.IDLE:
@@ -354,9 +294,6 @@ class TurnScheduler:
 
         return output_chunks
 
-    # ---------------------------------------------------------
-    # 状态处理子函数
-    # ---------------------------------------------------------
     def _handle_idle(self, model_chunk: ModelOutputChunk) -> List[Chunk]:
         if self.current_turn_idx == -1:
             self._advance_to_turn(0)
@@ -368,21 +305,17 @@ class TurnScheduler:
         if not turn:
             return chunks
 
-        # 1. 继续发送当前 Turn 音频（除非正在打断）
         if not self._is_interrupting:
             turn_chunk = self._consume_turn_audio()
             if turn_chunk:
                 chunks.append(turn_chunk)
 
-        # 2. 检查音频是否发完
         turn_audio_finished = self._is_turn_audio_finished()
 
-        # 3. 处理 transition
         handler = self._get_transition_handler(turn.transition)
 
         if turn_audio_finished:
             if turn.transition.type == "fixed":
-                # 固定过渡：发送过渡音频，然后进入下一轮
                 trans_chunks = handler.get_transition_audio(self)
                 chunks.extend(trans_chunks)
                 if handler.should_advance(self, model_chunk):
@@ -393,12 +326,10 @@ class TurnScheduler:
                     if handler.should_advance(self, model_chunk):
                         self._advance_to_next_turn()
                 else:
-                    # 进入等待模型状态
                     self.state = SchedulerState.WAITING_MODEL_RESPONSE
             else:
                 self._advance_to_next_turn()
 
-        # 4. 全双工并发：记录模型首响时间
         if model_chunk.type in ("audio", "text") and not turn_audio_finished:
             if self.current_turn_idx not in self.stats["model_first_response_times"]:
                 self.stats["model_first_response_times"][self.current_turn_idx] = (
@@ -445,9 +376,6 @@ class TurnScheduler:
             self.state = SchedulerState.PLAYING_TURN
         return chunks
 
-    # ---------------------------------------------------------
-    # 辅助方法
-    # ---------------------------------------------------------
     def _get_current_turn(self) -> Optional[Turn]:
         if 0 <= self.current_turn_idx < len(self.turns):
             return self.turns[self.current_turn_idx]
@@ -527,9 +455,6 @@ class TurnScheduler:
 
         return FixedSeamlessHandler()
 
-    # ---------------------------------------------------------
-    # 公共 API
-    # ---------------------------------------------------------
     def is_finished(self) -> bool:
         return self.state == SchedulerState.FINISHED
 
@@ -540,21 +465,112 @@ class TurnScheduler:
         return self.stats
 
     def inject_interrupt_audio(self, chunks: List[Chunk]) -> None:
-        """
-        外部注入打断音频（如 fixed_delay_interrupt 场景下需要立即插入的音频）。
-        由交互模拟子系统在检测到打断条件时调用。
-        """
         for c in chunks:
             self._interrupt_audio_queue.put(c)
         self._is_interrupting = True
         self.state = SchedulerState.INTERRUPTING
 
 
+# ============================================================
+# 4. 示例：本地文件音频库实现 + 测试入口
+# ============================================================
+
+import json
+import argparse
+import struct
+
+
+class LocalAudioLibrary(AudioLibrary):
+    """
+    AudioLibrary 的本地文件实现示例。
+    
+    资源目录结构（示例）：
+    audio_library/
+        wake_xiaoai.wav
+        cmd_play_music.wav
+        interrupt_stop.wav
+        ambient_office.wav   # 环境音
+    """
+
+    def __init__(
+        self,
+        library_dir: str,
+        chunk_size_ms: int = 200,
+        sample_rate: int = 24000,
+    ):
+        self.library_dir = Path(library_dir)
+        self.chunk_size_ms = chunk_size_ms
+        self.sample_rate = sample_rate
+        self.bytes_per_ms = sample_rate * 2 // 1000  # 16bit mono
+
+    def _slice_pcm(self, pcm: bytes, clip_id: str) -> List[Chunk]:
+        """将原始 PCM 按固定 chunk_size_ms 切割"""
+        chunk_bytes = self.chunk_size_ms * self.bytes_per_ms
+        chunks = []
+        total = len(pcm)
+        for i, offset in enumerate(range(0, total, chunk_bytes)):
+            piece = pcm[offset : offset + chunk_bytes]
+            actual_duration_ms = len(piece) // self.bytes_per_ms
+            chunks.append(
+                Chunk.audio(
+                    pcm=piece,
+                    timestamp_ms=i * self.chunk_size_ms,
+                    duration_ms=actual_duration_ms,
+                    meta={"clip_id": clip_id, "seq": i},
+                )
+            )
+        return chunks
+
+    def _load_wav_pcm(self, clip_id: str) -> bytes:
+        """简易 wav 读取，返回 16bit mono PCM bytes"""
+        wav_path = self.library_dir / f"{clip_id}.wav"
+        if not wav_path.exists():
+            raise FileNotFoundError(f"音频库缺少文件: {wav_path}")
+
+        with open(wav_path, "rb") as f:
+            data = f.read()
+
+        # 简易解析：跳过 44 字节 WAV 头（生产环境应使用 wave 模块）
+        return data[44:]
+
+    def load_turn_audio(self, turn: Turn) -> List[Chunk]:
+        pcm = self._load_wav_pcm(turn.content.base_clip_id)
+        # 这里可接入 Processing（变速、音量、淡入淡出等）
+        # 示例中直接原样切割
+        return self._slice_pcm(pcm, turn.content.base_clip_id)
+
+    def load_ambient_audio(
+        self, clip_id: str, duration_ms: int, volume_db: float
+    ) -> List[Chunk]:
+        pcm = self._load_wav_pcm(clip_id)
+        # 截取指定时长（如果文件更长）
+        max_bytes = duration_ms * self.bytes_per_ms
+        pcm = pcm[:max_bytes]
+        # 这里可接入 volume_db 增益
+        return self._slice_pcm(pcm, clip_id)
+
+    def generate_silence(self, duration_ms: int) -> List[Chunk]:
+        """生成空 PCM 静音，切成固定大小"""
+        total_bytes = duration_ms * self.bytes_per_ms
+        chunk_bytes = self.chunk_size_ms * self.bytes_per_ms
+        chunks = []
+        seq = 0
+        for offset in range(0, total_bytes, chunk_bytes):
+            piece_len = min(chunk_bytes, total_bytes - offset)
+            actual_duration_ms = piece_len // self.bytes_per_ms
+            # 空 PCM（16bit = 0x0000）
+            silence_pcm = b"\x00\x00" * (piece_len // 2)
+            chunks.append(
+                Chunk.silence(
+                    duration_ms=actual_duration_ms,
+                    meta={"source": "generated_silence", "seq": seq},
+                )
+            )
+            seq += 1
+        return chunks
+
 
 def load_scenario_from_json(path: str | Path) -> Scenario:
-    """
-    从外部 JSON 文件加载并校验剧本。
-    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"剧本文件不存在: {path}")
@@ -565,58 +581,35 @@ def load_scenario_from_json(path: str | Path) -> Scenario:
     return ScenarioValidator.validate_json(raw)
 
 
-def run_full_duplex_loop_example(scenario_path: str | Path) -> None:
+def run_full_duplex_loop_example(scenario_path: str | Path, library_dir: str) -> None:
     """
-    从外部 JSON 读取剧本，运行全双工交互模拟。
-
-    调用方式：
-        python scheduler.py --scenario /path/to/scenario.json
+    从外部 JSON 读取剧本，通过 LocalAudioLibrary 加载音频资源。
+    
+    调用：
+        python scheduler.py --scenario scenario.json --library ./audio_library/
     """
-    # 1. 加载剧本
     scenario = load_scenario_from_json(scenario_path)
     print(f"✅ 剧本加载成功: {scenario.id} ({scenario.name})")
     print(f"   共 {len(scenario.turns)} 轮")
 
-    # 2. 初始化调度器
-    scheduler = TurnScheduler()
+    # 初始化音频库（固定 chunk 大小 200ms）
+    audio_lib = LocalAudioLibrary(
+        library_dir=library_dir,
+        chunk_size_ms=200,
+        sample_rate=scenario.global_config.sample_rate,
+    )
 
-    # 3. 音频提供回调（对接音频编辑子系统）
-    #    实际工程中，这里应调用 audio_editor.load_processed_clip(...)
-    def audio_provider(turn_idx: int, turn: Turn) -> List[Chunk]:
-        clip_id = turn.content.base_clip_id
-        # 模拟：每个 clip 生成 10 个 200ms 的音频 chunk
-        return [
-            Chunk.audio(
-                b"\x00" * 4800,  # 24000Hz * 0.2s * 1ch * 2bytes = 9600 bytes (示例用占位)
-                timestamp_ms=i * 200,
-                duration_ms=200,
-                meta={"clip_id": clip_id, "seq": i},
-            )
-            for i in range(10)
-        ]
+    # 初始化调度器
+    scheduler = TurnScheduler(audio_library=audio_lib)
+    scheduler.load_scenario(scenario)
 
-    scheduler.load_scenario(scenario, audio_provider)
-
-    # 4. 模拟模型输出流（实际工程中由模型推理循环提供）
-    #    这里根据剧本轮次动态生成模拟数据
+    # 模拟模型输出流
     model_outputs = []
-
     for turn in scenario.turns:
-        # 模拟模型开始说话
         model_outputs.append(ModelOutputChunk("state", None, state_tag="<speak>"))
-        # 模拟文本输出
-        model_outputs.append(
-            ModelOutputChunk("text", f"回复第{turn.turn_id}轮", duration_ms=300)
-        )
-        # 模拟音频输出
-        model_outputs.append(
-            ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=True)
-        )
-        # 模拟静音
-        model_outputs.append(
-            ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=False)
-        )
-        # 模拟状态切换为听
+        model_outputs.append(ModelOutputChunk("text", f"回复第{turn.turn_id}轮", duration_ms=300))
+        model_outputs.append(ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=True))
+        model_outputs.append(ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=False))
         model_outputs.append(ModelOutputChunk("state", None, state_tag="<listen>"))
 
     print("=" * 50)
@@ -647,6 +640,7 @@ def run_full_duplex_loop_example(scenario_path: str | Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="全双工评测调度器")
     parser.add_argument("--scenario", "-s", required=True, help="剧本 JSON 文件路径")
+    parser.add_argument("--library", "-l", required=True, help="音频资源库目录路径")
     args = parser.parse_args()
 
-    run_full_duplex_loop_example(args.scenario)
+    run_full_duplex_loop_example(args.scenario, args.library)
