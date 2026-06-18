@@ -36,6 +36,11 @@ from format import (
     AudioExpectation, Action,
 )
 
+import json
+import argparse
+
+
+
 
 # ============================================================
 # 1. 调度器状态机
@@ -545,113 +550,92 @@ class TurnScheduler:
         self.state = SchedulerState.INTERRUPTING
 
 
-# ============================================================
-# 4. 全双工循环集成示例
-# ============================================================
 
-def run_full_duplex_loop_example() -> None:
+def load_scenario_from_json(path: str | Path) -> Scenario:
     """
-    展示如何在全双工交互循环中使用 TurnScheduler。
+    从外部 JSON 文件加载并校验剧本。
     """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"剧本文件不存在: {path}")
 
-    from format import ScenarioValidator
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
 
-    # 1. 初始化
+    return ScenarioValidator.validate_json(raw)
+
+
+def run_full_duplex_loop_example(scenario_path: str | Path) -> None:
+    """
+    从外部 JSON 读取剧本，运行全双工交互模拟。
+
+    调用方式：
+        python scheduler.py --scenario /path/to/scenario.json
+    """
+    # 1. 加载剧本
+    scenario = load_scenario_from_json(scenario_path)
+    print(f"✅ 剧本加载成功: {scenario.id} ({scenario.name})")
+    print(f"   共 {len(scenario.turns)} 轮")
+
+    # 2. 初始化调度器
     scheduler = TurnScheduler()
 
-    # 2. 音频提供回调（对接音频编辑子系统）
+    # 3. 音频提供回调（对接音频编辑子系统）
+    #    实际工程中，这里应调用 audio_editor.load_processed_clip(...)
     def audio_provider(turn_idx: int, turn: Turn) -> List[Chunk]:
         clip_id = turn.content.base_clip_id
-        return [Chunk.audio(b"fake_pcm", 0, 200, meta={"clip_id": clip_id})] * 10
+        # 模拟：每个 clip 生成 10 个 200ms 的音频 chunk
+        return [
+            Chunk.audio(
+                b"\x00" * 4800,  # 24000Hz * 0.2s * 1ch * 2bytes = 9600 bytes (示例用占位)
+                timestamp_ms=i * 200,
+                duration_ms=200,
+                meta={"clip_id": clip_id, "seq": i},
+            )
+            for i in range(10)
+        ]
 
-    # 3. 构造并加载剧本
-    raw_scenario = {
-        "id": "test_001",
-        "name": "唤醒后打断",
-        "description": "测试唤醒与打断",
-        "version": "1.0",
-        "global": {"sample_rate": 24000, "initial_silence_ms": 1000},
-        "turns": [
-            {
-                "turn_id": 0,
-                "name": "唤醒",
-                "description": "发送唤醒词",
-                "content": {
-                    "base_clip_id": "wake_word",
-                    "text_ground_truth": "小爱同学",
-                    "processing": {"fade_in_ms": 50, "fade_out_ms": 50},
-                },
-                "transition": {
-                    "type": "reactive",
-                    "reactive": {
-                        "trigger": "after_model_speech",
-                        "params": {"silence_threshold_ms": 600},
-                    },
-                },
-                "expected": {
-                    "response_type": "text",
-                    "text": {
-                        "should_contain": ["在", "嗯"],
-                        "match_mode": "contains",
-                    },
-                },
-            },
-            {
-                "turn_id": 1,
-                "name": "打断",
-                "description": "在模型回复中途打断",
-                "content": {
-                    "base_clip_id": "interrupt_stop",
-                    "text_ground_truth": "停，换成陈奕迅的",
-                    "processing": {"speed_ratio": 1.1, "fade_in_ms": 20},
-                },
-                "transition": {
-                    "type": "reactive",
-                    "reactive": {
-                        "trigger": "fixed_delay_interrupt",
-                        "params": {"inject_after_model_start_ms": 1500},
-                    },
-                },
-                "expected": {
-                    "response_type": "text",
-                    "text": {
-                        "should_contain": ["陈奕迅"],
-                        "match_mode": "contains",
-                    },
-                    "actions": [{"type": "confirm"}],
-                },
-            },
-        ],
-    }
-
-    scenario = ScenarioValidator.validate_json(raw_scenario)
     scheduler.load_scenario(scenario, audio_provider)
 
-    # 4. 模拟模型输出流
-    model_outputs = [
-        ModelOutputChunk("state", None, state_tag="<speak>"),
-        ModelOutputChunk("text", "在的，请说", duration_ms=300),
-        ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=True),
-        ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=False),
-        ModelOutputChunk("state", None, state_tag="<listen>"),
-        # Turn 1: 打断
-        ModelOutputChunk("state", None, state_tag="<speak>"),
-        ModelOutputChunk("text", "好的我正在", duration_ms=400),
-    ]
+    # 4. 模拟模型输出流（实际工程中由模型推理循环提供）
+    #    这里根据剧本轮次动态生成模拟数据
+    model_outputs = []
+
+    for turn in scenario.turns:
+        # 模拟模型开始说话
+        model_outputs.append(ModelOutputChunk("state", None, state_tag="<speak>"))
+        # 模拟文本输出
+        model_outputs.append(
+            ModelOutputChunk("text", f"回复第{turn.turn_id}轮", duration_ms=300)
+        )
+        # 模拟音频输出
+        model_outputs.append(
+            ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=True)
+        )
+        # 模拟静音
+        model_outputs.append(
+            ModelOutputChunk("audio", b"pcm", duration_ms=300, is_speech=False)
+        )
+        # 模拟状态切换为听
+        model_outputs.append(ModelOutputChunk("state", None, state_tag="<listen>"))
 
     print("=" * 50)
     print("全双工交互循环开始")
     print("=" * 50)
 
     for i, model_chunk in enumerate(model_outputs):
-        print(f"\n[循环 {i}] 模型输入: type={model_chunk.type}, "
-              f"state={model_chunk.state_tag}, speech={model_chunk.is_speech}")
+        print(
+            f"\n[循环 {i}] 模型输入: type={model_chunk.type}, "
+            f"state={model_chunk.state_tag}, speech={model_chunk.is_speech}"
+        )
 
         to_send = scheduler.on_model_chunk(model_chunk)
 
         for chunk in to_send:
-            print(f"  -> 调度输出: type={chunk.type}, duration={chunk.duration_ms}, "
-                  f"meta={chunk.meta}")
+            print(
+                f"  -> 调度输出: type={chunk.type}, duration={chunk.duration_ms}, "
+                f"meta={chunk.meta}"
+            )
 
         if scheduler.is_finished():
             print("\n[剧本结束]")
@@ -661,4 +645,8 @@ def run_full_duplex_loop_example() -> None:
 
 
 if __name__ == "__main__":
-    run_full_duplex_loop_example()
+    parser = argparse.ArgumentParser(description="全双工评测调度器")
+    parser.add_argument("--scenario", "-s", required=True, help="剧本 JSON 文件路径")
+    args = parser.parse_args()
+
+    run_full_duplex_loop_example(args.scenario)
