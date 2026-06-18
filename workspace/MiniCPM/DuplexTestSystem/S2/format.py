@@ -8,26 +8,35 @@ format.py
   2. 模型输出 Chunk
   3. 剧本完整层级（Scenario → Turn → ...）
   4. 音频资源库接口（AudioLibrary）
+  5. 剧本校验器
+
+本文件不含任何调度、音频处理或 I/O 逻辑。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Literal, Tuple
+from typing import Optional, List, Dict, Any, Literal
 from abc import ABC, abstractmethod
 
 
 # ============================================================
-# 1. 流式 Chunk
+# 1. 流式 Chunk（调度器输入输出的通用单元）
 # ============================================================
 
 @dataclass
 class Chunk:
+    """
+    调度器与全双工循环之间的通用数据单元。
+    音频编辑子系统产出、交互模拟子系统消费、调度器仲裁。
+    """
     type: Literal["audio", "text", "control", "silence"]
     payload: Any = None
-    timestamp_ms: float = 0.0
-    duration_ms: float = 0.0
-    is_speech: Optional[bool] = None
+    timestamp_ms: float = 0.0          # 相对于本轮交互起始的时间戳
+    duration_ms: float = 0.0           # 音频有效时长（仅 audio / silence）
+    is_speech: Optional[bool] = None   # VAD 结果（仅 audio）
+
+    # 追踪来源，用于日志与调试
     meta: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -81,17 +90,26 @@ class Chunk:
 
 @dataclass
 class ModelOutputChunk:
+    """
+    模型回复的流式输出，由全双工循环输入给调度器。
+    包含音频帧、文本 token、或状态占位符（如 <speak> / <listen>）。
+    """
     type: Literal["audio", "text", "state"]
     payload: Any
     timestamp_ms: float = 0.0
+
+    # 状态占位符（模型输出的特殊 token）
     state_tag: Optional[str] = None
+
+    # 音频属性
     duration_ms: float = 0.0
     is_speech: Optional[bool] = None
+
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================
-# 2. 音频资源库接口（新增）
+# 2. 音频资源库接口
 # ============================================================
 
 class AudioLibrary(ABC):
@@ -140,7 +158,7 @@ class AudioLibrary(ABC):
 
 
 # ============================================================
-# 3. 剧本层级结构
+# 3. 剧本层级结构（与说明书 1:1 映射）
 # ============================================================
 
 @dataclass
@@ -158,13 +176,14 @@ class GlobalConfig:
 
 @dataclass
 class Processing:
+    """单段音频加工选项，声明式，由音频编辑子系统执行。"""
     denoise: bool = False
     normalize: bool = False
-    speed_ratio: float = 1.0
+    speed_ratio: float = 1.0          # [0.5, 2.0]
     trim_silence: bool = False
-    volume_db: float = 0.0
-    fade_in_ms: int = 0
-    fade_out_ms: int = 0
+    volume_db: float = 0.0            # [-20.0, 10.0]
+    fade_in_ms: int = 0               # [0, 5000]
+    fade_out_ms: int = 0              # [0, 5000]
 
 
 @dataclass
@@ -177,7 +196,9 @@ class Content:
 @dataclass
 class FixedTransition:
     mode: Literal["silence", "ambient", "seamless"]
+    # mode == "silence"
     silence_duration_ms: Optional[int] = None
+    # mode == "ambient"
     ambient_clip_id: Optional[str] = None
     ambient_duration_ms: Optional[int] = None
     ambient_volume_db: float = 0.0
@@ -257,19 +278,28 @@ class ValidationError(Exception):
 
 
 class ScenarioValidator:
+    """
+    对剧本做静态合法性校验。
+    不检查音频文件是否存在（那是音频编辑子系统的职责）。
+    """
+
     @staticmethod
     def validate(scenario: Scenario) -> None:
         errors: List[str] = []
 
+        # 1. turn_id 连续递增
         for i, turn in enumerate(scenario.turns):
             if turn.turn_id != i:
                 errors.append(f"Turn turn_id 必须连续递增：期望 {i}，实际 {turn.turn_id}")
 
+        # 2. 必填字段
+        for turn in scenario.turns:
             if not turn.content.base_clip_id:
                 errors.append(f"Turn {turn.turn_id}: base_clip_id 不能为空")
             if not turn.content.text_ground_truth:
                 errors.append(f"Turn {turn.turn_id}: text_ground_truth 不能为空")
 
+            # Transition 合法性
             if turn.transition.type == "fixed":
                 if turn.transition.fixed is None:
                     errors.append(f"Turn {turn.turn_id}: fixed transition 缺少 fixed 字段")
@@ -295,6 +325,7 @@ class ScenarioValidator:
                         if p not in rt.params:
                             errors.append(f"Turn {turn.turn_id}: trigger '{rt.trigger}' 缺少参数 '{p}'")
 
+            # Expected 一致性
             exp = turn.expected
             if exp.response_type == "none" and (exp.text or exp.audio):
                 errors.append(f"Turn {turn.turn_id}: response_type=none 时不应有 text/audio 子字段")
@@ -306,6 +337,10 @@ class ScenarioValidator:
 
     @staticmethod
     def validate_json(scenario_dict: Dict[str, Any]) -> Scenario:
+        """
+        从字典反序列化并校验。
+        实际工程中可替换为 pydantic / marshmallow。
+        """
         global_cfg = scenario_dict.get("global", {})
         bg = global_cfg.get("background_noise")
         background_noise = BackgroundNoise(**bg) if bg else None
