@@ -1,1 +1,5 @@
-
+{
+  "chunk_size_ms": 200,
+  "audio_library_metadata": "./audio_library/metadata.json",
+  "sample_rate": 24000
+}
