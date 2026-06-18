@@ -21,21 +21,19 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Callable, Any
 from abc import ABC, abstractmethod
 
+import sys
+from pathlib import Path
+
+# 将本文件所在目录加入 sys.path，确保能找到同级的 format.py
+_FILE_DIR = Path(__file__).resolve().parent
+if str(_FILE_DIR) not in sys.path:
+    sys.path.insert(0, str(_FILE_DIR))
+
 from format import (
-    Chunk,
-    ModelOutputChunk,
-    Scenario,
-    Turn,
-    Transition,
-    FixedTransition,
-    ReactiveTransition,
-    GlobalConfig,
-    Content,
-    Processing,
-    Expected,
-    TextExpectation,
-    AudioExpectation,
-    Action,
+    Chunk, ModelOutputChunk, Scenario, Turn, Transition,
+    FixedTransition, ReactiveTransition, GlobalConfig,
+    Content, Processing, Expected, TextExpectation,
+    AudioExpectation, Action,
 )
 
 
