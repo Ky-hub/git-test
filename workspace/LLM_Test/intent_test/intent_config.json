@@ -1,0 +1,25 @@
+{
+  "intents": [
+    {
+      "name": "greeting",
+      "description": "用户打招呼、问候、寒暄",
+      "examples": ["你好", "早上好", "嗨"]
+    },
+    {
+      "name": "weather_query",
+      "description": "查询天气、气温、降雨等气象信息",
+      "examples": ["今天天气怎么样", "明天会下雨吗"]
+    },
+    {
+      "name": "farewell",
+      "description": "用户告别、结束对话",
+      "examples": ["再见", "拜拜", "回头见"]
+    },
+    {
+      "name": "book_flight",
+      "description": "预订机票、查询航班",
+      "examples": ["帮我订一张去上海的机票", "查询明天飞北京的航班"]
+    }
+  ],
+  "fallback_intent": "chat"
+}
