@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 批量单轮对话客户端（无需 API Key）
-从 example_questions.txt 读取问题，逐条调用 /v1/chat/completions，结果保存到文件
+从 example_questions.txt 读取问题，逐条调用 /v1/chat/completions，结果持续保存到文件
 """
 
 import os
@@ -87,24 +87,47 @@ def chat_completions(
         return {"error": f"JSON 解析失败: {e}"}
 
 
-def save_results_json(results: list, filepath: str):
-    """保存结果为 JSON 文件"""
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"[保存成功] {filepath}")
+# ==================== 持续写入相关函数 ====================
+
+def init_output_file(filepath: str):
+    """初始化输出文件（已存在则清空），为持续追加做准备"""
+    if filepath.endswith(".json"):
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("[\n")
+    else:
+        # txt 直接清空或创建空文件
+        with open(filepath, "w", encoding="utf-8") as f:
+            pass
 
 
-def save_results_txt(results: list, filepath: str):
-    """保存结果为纯文本文件"""
-    with open(filepath, "w", encoding="utf-8") as f:
-        for idx, item in enumerate(results, 1):
-            f.write(f"===== 问题 {idx} =====\n")
-            f.write(f"Q: {item['question']}\n\n")
-            f.write(f"A: {item['answer']}\n")
-            if item.get("error"):
-                f.write(f"[错误] {item['error']}\n")
-            f.write("\n")
-    print(f"[保存成功] {filepath}")
+def append_result_json(result: dict, filepath: str, is_first: bool):
+    """追加写入一条 JSON 结果（标准 JSON 数组格式）"""
+    with open(filepath, "a", encoding="utf-8") as f:
+        if not is_first:
+            f.write(",\n")
+        json.dump(result, f, ensure_ascii=False, indent=2)
+
+
+def append_result_txt(result: dict, filepath: str):
+    """追加写入一条 TXT 结果"""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(f"===== 问题 {result['index']} =====\n")
+        f.write(f"Q: {result['question']}\n\n")
+        f.write(f"A: {result['answer']}\n")
+        if result.get("error"):
+            f.write(f"[错误] {result['error']}\n")
+        f.write("\n")
+
+
+def finalize_output_file(filepath: str):
+    """结束 JSON 数组（仅 JSON 格式需要）"""
+    if filepath.endswith(".json"):
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write("\n]")
+        print(f"[保存完成] {filepath}")
+
+
+# ========================================================
 
 
 def main():
@@ -123,6 +146,9 @@ def main():
     if system_prompt:
         print(f"[system prompt] 已加载 ({SYSTEM_PROMPT_FILE})")
     print("-" * 50)
+
+    # 初始化输出文件
+    init_output_file(OUTPUT_FILE)
 
     results = []
     start_time = time.time()
@@ -152,25 +178,31 @@ def main():
                 error_msg = f"响应结构异常: {e}"
                 print(f"  → [失败] {error_msg}")
 
-        results.append({
+        result = {
             "index": idx,
             "question": question,
             "answer": answer,
             "error": error_msg,
             "timestamp": datetime.now().isoformat(),
-        })
+        }
+        results.append(result)
+
+        # ========== 关键改动：每处理完一条立即写入文件 ==========
+        if OUTPUT_FILE.endswith(".json"):
+            append_result_json(result, OUTPUT_FILE, is_first=(idx == 1))
+        else:
+            append_result_txt(result, OUTPUT_FILE)
+        print(f"  → [已保存] 落盘成功")
+        # ======================================================
 
         if idx < len(questions) and DELAY > 0:
             time.sleep(DELAY)
 
+    # 结束 JSON 数组（仅 JSON 格式）
+    finalize_output_file(OUTPUT_FILE)
+
     elapsed = time.time() - start_time
     print(f"\n[完成] 共处理 {len(questions)} 条，耗时 {elapsed:.1f} 秒")
-
-    # 保存结果
-    if OUTPUT_FILE.endswith(".json"):
-        save_results_json(results, OUTPUT_FILE)
-    else:
-        save_results_txt(results, OUTPUT_FILE)
 
     # 统计
     success_count = sum(1 for r in results if not r["error"])
