@@ -1,19 +1,24 @@
 {
   "intents": [
     {
+      "name": "chat",
+      "description": "普通对话、闲聊、日常交流、无特定目的的提问或回答",
+      "examples": ["最近怎么样", "讲个笑话", "你觉得呢", "为什么"]
+    },
+    {
       "name": "greeting",
       "description": "用户打招呼、问候、寒暄",
-      "examples": ["你好", "早上好", "嗨"]
+      "examples": ["你好", "早上好", "晚上好", "嗨", "hello"]
     },
     {
       "name": "weather_query",
       "description": "查询天气、气温、降雨等气象信息",
-      "examples": ["今天天气怎么样", "明天会下雨吗"]
+      "examples": ["今天天气怎么样", "明天会下雨吗", "北京气温多少度"]
     },
     {
       "name": "farewell",
       "description": "用户告别、结束对话",
-      "examples": ["再见", "拜拜", "回头见"]
+      "examples": ["再见", "拜拜", "bye", "回头见", "我先走了"]
     },
     {
       "name": "book_flight",
