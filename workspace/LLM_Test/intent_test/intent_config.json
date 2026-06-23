@@ -1,35 +1,34 @@
 {
-  "intents": [
+  "categories": [
     {
-      "name": "chat",
-      "category": "基础交互",
-      "description": "普通对话、闲聊、日常交流、无特定目的的提问",
-      "examples": ["最近怎么样", "讲个笑话", "你觉得呢", "随便聊聊"]
+      "name": "基础交互",
+      "description": "打招呼、告别、闲聊等日常社交对话，无明确业务目的",
+      "examples": ["你好", "再见", "随便聊聊", "在吗", "讲个笑话"],
+      "intents": [
+        {"name": "greeting", "description": "打招呼、问候", "examples": ["你好", "早上好", "晚上好"]},
+        {"name": "farewell", "description": "告别、结束对话", "examples": ["再见", "拜拜", "回头见"]},
+        {"name": "chat", "description": "普通闲聊、无目的对话", "examples": ["最近怎么样", "你觉得呢"]}
+      ]
     },
     {
-      "name": "greeting",
-      "category": "基础交互",
-      "description": "用户打招呼、问候、寒暄",
-      "examples": ["你好", "早上好", "晚上好", "嗨", "hello"]
+      "name": "信息查询",
+      "description": "查询各类实时或静态信息，如天气、新闻、百科等",
+      "examples": ["今天天气怎么样", "北京气温多少度", "明天会下雨吗", "最近有什么新闻"],
+      "intents": [
+        {"name": "weather_query", "description": "查询天气、气温、降雨", "examples": ["今天天气怎么样", "明天几度"]},
+        {"name": "news_query", "description": "查询新闻资讯", "examples": ["最近有什么新闻", "今天的热点"]}
+      ]
     },
     {
-      "name": "farewell",
-      "category": "基础交互",
-      "description": "用户告别、结束对话",
-      "examples": ["再见", "拜拜", "bye", "回头见"]
-    },
-    {
-      "name": "weather_query",
-      "category": "信息查询",
-      "description": "查询天气、气温、降雨等气象信息",
-      "examples": ["今天天气怎么样", "明天会下雨吗", "北京气温多少度"]
-    },
-    {
-      "name": "book_flight",
-      "category": "业务办理",
-      "description": "预订机票、查询航班",
-      "examples": ["帮我订一张去上海的机票", "查询明天飞北京的航班"]
+      "name": "业务办理",
+      "description": "办理具体业务、下单、预订、预约等操作型需求",
+      "examples": ["帮我订一张机票", "我要买火车票", "预约挂号", "下单买咖啡"],
+      "intents": [
+        {"name": "book_flight", "description": "预订机票", "examples": ["订去上海的机票", "查明天飞北京的航班"]},
+        {"name": "buy_ticket", "description": "购买车票", "examples": ["买火车票", "订高铁票"]},
+        {"name": "make_appointment", "description": "预约挂号、预约服务", "examples": ["预约医院挂号", "预约理发"]}
+      ]
     }
   ],
-  "fallback_intent": "chat"
+  "fallback_category": "普通对话"
 }
