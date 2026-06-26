@@ -5,6 +5,13 @@
 支持从 config.yaml/config.json 读取配置，流式计算首Token时延(TTFT)
 兼容 Qwen 系列模型 /v1/chat/completions 接口
 
+指标说明:
+    queue_wait_ms      : 请求发送 → 收到响应头（服务端排队+网络往返）
+    ttft_ms            : 请求发送 → 首个有效token（Time To First Token）
+    generation_time_ms : 首个token → 最后一个token（纯生成耗时）
+    e2e_latency_ms     : 请求发送 → 最后一个token（端到端总延迟）
+    per_10char_ms      : 平均每10个字的生成时间（流式输出阶段）
+
 使用方式:
     python chat_client.py                # 默认读取 config.yaml
     python chat_client.py my_config.json # 指定配置文件
@@ -132,7 +139,7 @@ def chat_completions(
 ):
     """
     调用 /v1/chat/completions 接口（Qwen 系列兼容）
-    无需认证（如需要可在 headers 中自行添加 Authorization）
+    修正：在 requests.post 调用前记录 start_time，附加到 response 对象上
     """
     url = api_url.rstrip("/") + "/v1/chat/completions"
     headers = {
@@ -148,11 +155,19 @@ def chat_completions(
         "max_tokens": max_tokens,
     }
 
+    # ========== start_time 必须在请求发送前记录 ==========
+    start_time = time.perf_counter()
+
     try:
         response = requests.post(
             url, headers=headers, json=payload,
             stream=stream, timeout=timeout
         )
+        # 收到响应头的时间（可用于分析服务端排队等待）
+        headers_time = time.perf_counter()
+        # 将时间戳附加到 response 对象，传递给解析函数
+        response._start_time = start_time
+        response._headers_time = headers_time
         response.raise_for_status()
         return response
     except requests.exceptions.RequestException as e:
@@ -162,14 +177,30 @@ def chat_completions(
 
 def parse_stream_with_ttft(response, user_id: str = "", round_idx: int = 0):
     """
-    解析 SSE 流式响应，逐字输出并精确计算首Token时延(TTFT)
-    返回: (完整回复内容, 首Token时延ms, 总耗时ms)
+    解析 SSE 流式响应，逐字输出并精确计算时延指标
+
+    新增指标:
+        per_10char_ms      : 平均每10个字的生成时间（仅统计流式输出阶段）
+
+    返回: (完整回复内容, queue_wait_ms, ttft_ms, generation_time_ms, e2e_latency_ms, per_10char_ms_list, avg_per_10char_ms)
     """
+    # 从 response 对象读取请求发送时间
+    start_time = getattr(response, '_start_time', time.perf_counter())
+    headers_time = getattr(response, '_headers_time', start_time)
+    queue_wait_ms = (headers_time - start_time) * 1000
+
     full_content = ""
     ttft_ms = 0.0
-    total_ms = 0.0
+    generation_time_ms = 0.0
+    e2e_latency_ms = 0.0
+    first_token_time = 0.0
     first_token_received = False
-    start_time = time.time()
+
+    # ========== 每10个字生成时间统计 ==========
+    per_10char_times = []       # 记录每10个字的耗时列表
+    char_count_since_mark = 0   # 自上次标记以来累计的字符数
+    chunk_start_time = 0.0      # 当前这10个字的开始时间
+    # ========================================
 
     for line in response.iter_lines(decode_unicode=True):
         if not line:
@@ -187,38 +218,86 @@ def parse_stream_with_ttft(response, user_id: str = "", round_idx: int = 0):
                 content = delta.get("content", "")
 
                 if content:
+                    current_time = time.perf_counter()
+
                     # 首次收到有效内容，记录首Token时延
                     if not first_token_received:
-                        first_token_time = time.time()
+                        first_token_time = current_time
                         ttft_ms = (first_token_time - start_time) * 1000
                         first_token_received = True
-                        safe_print(f"\n[TTFT] {ttft_ms:.2f}ms", end=" ")
+                        # 第一个10字区间的起点就是首token时间
+                        chunk_start_time = first_token_time
+                        safe_print(
+                            f"\n[用户 {user_id}] 第 {round_idx}轮 | "
+                            f"QueueWait: {queue_wait_ms:.2f}ms | "
+                            f"TTFT: {ttft_ms:.2f}ms", end=" "
+                        )
 
                     # 流式输出（线程安全）
                     with _print_lock:
                         print(content, end="", flush=True)
                     full_content += content
 
+                    # ========== 每10个字计时逻辑 ==========
+                    char_count_since_mark += len(content)
+                    while char_count_since_mark >= 10:
+                        # 记录这10个字的耗时
+                        segment_ms = (current_time - chunk_start_time) * 1000
+                        per_10char_times.append(round(segment_ms, 2))
+                        # 重置下一组的起点
+                        chunk_start_time = current_time
+                        char_count_since_mark -= 10
+                    # =====================================
+
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
 
-    total_ms = (time.time() - start_time) * 1000
+    # 计算最终指标
+    last_token_time = time.perf_counter()
+    e2e_latency_ms = (last_token_time - start_time) * 1000
+    if first_token_received:
+        generation_time_ms = (last_token_time - first_token_time) * 1000
+
+    # 最后不满10个字的也记录（如果有生成内容的话）
+    if first_token_received and char_count_since_mark > 0 and per_10char_times:
+        # 用剩余字符按比例估算，或者简单忽略（因为样本太小意义不大）
+        # 这里选择：如果剩余字符>0且前面有完整10字记录，按比例估算
+        remainder_ms = (last_token_time - chunk_start_time) * 1000
+        estimated_per_10 = round(remainder_ms * 10 / char_count_since_mark, 2) if char_count_since_mark > 0 else 0
+        per_10char_times.append(estimated_per_10)
+
+    avg_per_10char_ms = round(
+        sum(per_10char_times) / len(per_10char_times), 2
+    ) if per_10char_times else 0.0
+
     print()  # 换行
-    return full_content, round(ttft_ms, 2), round(total_ms, 2)
+    return (
+        full_content,
+        round(queue_wait_ms, 2),
+        round(ttft_ms, 2),
+        round(generation_time_ms, 2),
+        round(e2e_latency_ms, 2),
+        per_10char_times,
+        avg_per_10char_ms,
+    )
 
 
 def parse_non_stream_response(response):
-    """解析非流式响应（TTFT等于总耗时）"""
-    start_time = time.time()
+    """解析非流式响应（无流式生成，generation_time = 0, per_10char = 0）"""
+    start_time = getattr(response, '_start_time', time.perf_counter())
+    headers_time = getattr(response, '_headers_time', start_time)
+    queue_wait_ms = (headers_time - start_time) * 1000
+
     try:
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         print(content)
-        total_ms = (time.time() - start_time) * 1000
-        return content, round(total_ms, 2), round(total_ms, 2)
+        e2e_latency_ms = (time.perf_counter() - start_time) * 1000
+        # 非流式模式下，TTFT = E2E，generation_time = 0, per_10char = 0
+        return content, round(queue_wait_ms, 2), round(e2e_latency_ms, 2), 0.0, round(e2e_latency_ms, 2), [], 0.0
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         print(f"[解析错误] {e}")
-        return "", 0.0, 0.0
+        return "", 0.0, 0.0, 0.0, 0.0, [], 0.0
 
 
 # ==================== 剧本执行引擎 ====================
@@ -229,16 +308,16 @@ def run_user_script(user: UserConfig, global_cfg: GlobalConfig) -> dict:
     每行一个用户输入，自动维护多轮对话历史
     """
     user_id = user.user_id
-    # safe_print(f"\n{":"*60}")
+    safe_print("\n" + "="*60)
     safe_print(f"[用户 {user_id}] 开始执行剧本")
-    # safe_print(f"{":"*60}")
+    safe_print("="*60)
 
     # 加载该用户的 system prompt
     system_prompt = load_system_prompt(user.system_prompt_file)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-        safe_print(f"[用户 {user_id}] 已加载 system prompt")
+        safe_print(f"[用户 {user_id}] 已加载 system prompt: {user.system_prompt_file}")
 
     # 读取剧本文件（跳过空行和 # 注释行）
     if not os.path.exists(user.script_file):
@@ -289,27 +368,49 @@ def run_user_script(user: UserConfig, global_cfg: GlobalConfig) -> dict:
                 "round": round_idx,
                 "user_input": user_input,
                 "error": "请求失败",
+                "queue_wait_ms": 0,
                 "ttft_ms": 0,
-                "total_ms": 0,
+                "generation_time_ms": 0,
+                "e2e_latency_ms": 0,
+                "per_10char_times": [],
+                "avg_per_10char_ms": 0,
                 "timestamp": datetime.now().isoformat(),
             })
             continue
 
         # 解析响应并计算时延
         if global_cfg.stream:
-            assistant_content, ttft_ms, total_ms = parse_stream_with_ttft(
-                response, user_id=user_id, round_idx=round_idx
-            )
+            (
+                assistant_content,
+                queue_wait_ms,
+                ttft_ms,
+                generation_time_ms,
+                e2e_latency_ms,
+                per_10char_times,
+                avg_per_10char_ms,
+            ) = parse_stream_with_ttft(response, user_id=user_id, round_idx=round_idx)
         else:
-            assistant_content, ttft_ms, total_ms = parse_non_stream_response(response)
+            (
+                assistant_content,
+                queue_wait_ms,
+                ttft_ms,
+                generation_time_ms,
+                e2e_latency_ms,
+                per_10char_times,
+                avg_per_10char_ms,
+            ) = parse_non_stream_response(response)
 
         # 记录本轮结果
         round_result = {
             "round": round_idx,
             "user_input": user_input,
             "assistant_output": assistant_content,
+            "queue_wait_ms": queue_wait_ms,
             "ttft_ms": ttft_ms,
-            "total_ms": total_ms,
+            "generation_time_ms": generation_time_ms,
+            "e2e_latency_ms": e2e_latency_ms,
+            "per_10char_times": per_10char_times,
+            "avg_per_10char_ms": avg_per_10char_ms,
             "timestamp": datetime.now().isoformat(),
         }
         round_results.append(round_result)
@@ -318,8 +419,14 @@ def run_user_script(user: UserConfig, global_cfg: GlobalConfig) -> dict:
         if assistant_content:
             messages.append({"role": "assistant", "content": assistant_content})
 
-        safe_print(f"[用户 {user_id}] 第 {round_idx} 轮完成 | "
-                   f"TTFT: {ttft_ms}ms | Total: {total_ms}ms")
+        safe_print(
+            f"[用户 {user_id}] 第 {round_idx} 轮完成 | "
+            f"QueueWait: {queue_wait_ms}ms | "
+            f"TTFT: {ttft_ms}ms | "
+            f"GenTime: {generation_time_ms}ms | "
+            f"E2E: {e2e_latency_ms}ms | "
+            f"Per10Char: {avg_per_10char_ms}ms"
+        )
 
     # 汇总统计
     valid_rounds = [r for r in round_results if "error" not in r]
@@ -327,19 +434,31 @@ def run_user_script(user: UserConfig, global_cfg: GlobalConfig) -> dict:
         "user_id": user_id,
         "total_rounds": len(lines),
         "completed_rounds": len(valid_rounds),
+        "avg_queue_wait_ms": round(
+            sum(r["queue_wait_ms"] for r in valid_rounds) / len(valid_rounds), 2
+        ) if valid_rounds else 0,
         "avg_ttft_ms": round(
             sum(r["ttft_ms"] for r in valid_rounds) / len(valid_rounds), 2
         ) if valid_rounds else 0,
-        "avg_total_ms": round(
-            sum(r["total_ms"] for r in valid_rounds) / len(valid_rounds), 2
+        "avg_generation_time_ms": round(
+            sum(r["generation_time_ms"] for r in valid_rounds) / len(valid_rounds), 2
+        ) if valid_rounds else 0,
+        "avg_e2e_latency_ms": round(
+            sum(r["e2e_latency_ms"] for r in valid_rounds) / len(valid_rounds), 2
+        ) if valid_rounds else 0,
+        "avg_per_10char_ms": round(
+            sum(r["avg_per_10char_ms"] for r in valid_rounds) / len(valid_rounds), 2
         ) if valid_rounds else 0,
         "details": round_results,
     }
 
     safe_print(f"\n[用户 {user_id}] 剧本执行完成")
     safe_print(f"  完成轮数: {summary['completed_rounds']}/{summary['total_rounds']}")
+    safe_print(f"  平均队列等待: {summary['avg_queue_wait_ms']} ms")
     safe_print(f"  平均首Token时延: {summary['avg_ttft_ms']} ms")
-    safe_print(f"  平均总耗时: {summary['avg_total_ms']} ms")
+    safe_print(f"  平均生成耗时: {summary['avg_generation_time_ms']} ms")
+    safe_print(f"  平均端到端延迟: {summary['avg_e2e_latency_ms']} ms")
+    safe_print(f"  平均每10字生成: {summary['avg_per_10char_ms']} ms")
 
     return summary
 
@@ -359,15 +478,19 @@ def save_results(results: List[dict], output_dir: str):
     # 2. 保存 CSV（方便 Excel 分析）
     csv_path = os.path.join(output_dir, f"benchmark_{timestamp}.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
-        f.write("user_id,round,user_input,ttft_ms,total_ms,timestamp\n")
+        f.write("user_id,round,user_input,queue_wait_ms,ttft_ms,generation_time_ms,e2e_latency_ms,avg_per_10char_ms,timestamp\n")
         for user_res in results:
             user_id = user_res.get("user_id", "unknown")
             for detail in user_res.get("details", []):
                 # 对 CSV 中的逗号和换行进行简单转义
                 inp = str(detail.get("user_input", "")).replace('"', '""').replace("\n", " ")
-                f.write(f"{user_id},{detail['round']},\"{inp}\","
-                        f"{detail['ttft_ms']},{detail['total_ms']},"
-                        f"{detail.get('timestamp', '')}\n")
+                f.write(
+                    f"{user_id},{detail['round']},\"{inp}\","
+                    f"{detail['queue_wait_ms']},{detail['ttft_ms']},"
+                    f"{detail['generation_time_ms']},{detail['e2e_latency_ms']},"
+                    f"{detail['avg_per_10char_ms']},"
+                    f"{detail.get('timestamp', '')}\n"
+                )
 
     safe_print(f"\n[结果已保存]")
     safe_print(f"  详细报告: {json_path}")
@@ -387,7 +510,7 @@ def main():
     if not os.path.exists(config_path):
         safe_print(f"[错误] 配置文件不存在: {config_path}")
         safe_print("\n请创建配置文件，例如 config.yaml：")
-        safe_print("""
+        safe_print(r"""
 # ========== config.yaml 示例 ==========
 api_url: "https://your-api-endpoint.com"   # Qwen API 地址
 model: "qwen3.6-27b"                       # 模型名称
@@ -437,14 +560,14 @@ users:
         safe_print("[错误] 请配置正确的 api_url（环境变量 API_URL 或配置文件）")
         sys.exit(1)
 
-    # safe_print(f"\n{":"*60}")
+    safe_print("\n" + "="*60)
     safe_print("[系统初始化]")
     safe_print(f"  API 端点: {global_cfg.api_url}")
     safe_print(f"  模型: {global_cfg.model}")
     safe_print(f"  流式模式: {global_cfg.stream}")
     safe_print(f"  并发用户数: {len(users)} (max_workers={global_cfg.max_workers})")
     safe_print(f"  输出目录: {global_cfg.output_dir}")
-    # safe_print(f"{":"*60}")
+    safe_print("="*60)
 
     # 执行多用户并发测试
     all_results = []
@@ -477,16 +600,22 @@ users:
     save_results(all_results, global_cfg.output_dir)
 
     # 最终汇总
-    # safe_print(f"\n{":"*60}")
+    safe_print("\n" + "="*60)
     safe_print("全部测试完成 - 总摘要")
-    # safe_print(f"{":"*60}")
+    safe_print("="*60)
     for r in all_results:
         uid = r.get("user_id", "unknown")
         if "error" in r:
             safe_print(f"[{uid}] 异常: {r['error']}")
         else:
-            safe_print(f"[{uid}] 完成: {r['completed_rounds']}/{r['total_rounds']} 轮 | "
-                       f"平均TTFT: {r['avg_ttft_ms']} ms | 平均Total: {r['avg_total_ms']} ms")
+            safe_print(
+                f"[{uid}] 完成: {r['completed_rounds']}/{r['total_rounds']} 轮 | "
+                f"AvgQueueWait: {r['avg_queue_wait_ms']} ms | "
+                f"AvgTTFT: {r['avg_ttft_ms']} ms | "
+                f"AvgGenTime: {r['avg_generation_time_ms']} ms | "
+                f"AvgE2E: {r['avg_e2e_latency_ms']} ms | "
+                f"AvgPer10Char: {r['avg_per_10char_ms']} ms"
+            )
 
 
 if __name__ == "__main__":
