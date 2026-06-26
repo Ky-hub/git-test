@@ -1,0 +1,50 @@
+# ==========================================
+# Qwen 多用户对话测试配置
+# ==========================================
+
+# API 端点（也可通过环境变量 API_URL 覆盖）
+api_url: "https://your-api-endpoint.com"
+
+# 模型名称（也可通过环境变量 MODEL 覆盖）
+model: "qwen3.6-27b"
+
+# 必须开启流式才能精确计算首Token时延(TTFT)
+stream: true
+
+# 请求超时时间（秒）
+timeout: 60
+
+# 并发线程池大小（同时跑几个用户）
+max_workers: 3
+
+# 测试结果输出目录
+output_dir: "results"
+
+# 是否打印详细日志
+verbose: true
+
+# ==========================================
+# 用户列表：程序自动感知此处长度
+# 每个用户独立线程 + 独立剧本 + 独立对话历史
+# ==========================================
+users:
+  - user_id: "tester_01"
+    script_file: "script_user1.txt"
+    system_prompt_file: "system_prompt_1.txt"
+    temperature: 0.7
+    max_tokens: 4096
+    think_time: 1.0
+
+  - user_id: "tester_02"
+    script_file: "script_user2.txt"
+    system_prompt_file: "system_prompt_2.txt"
+    temperature: 0.5
+    max_tokens: 2048
+    think_time: 0.5
+
+  - user_id: "tester_03"
+    script_file: "script_user3.txt"
+    # 不配置 system_prompt_file，该用户不使用 system prompt
+    temperature: 0.7
+    max_tokens: 4096
+    think_time: 2.0
