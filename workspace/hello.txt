@@ -1,5 +1,51 @@
 
 
+# -*- coding: utf-8 -*-
+"""
+Windows 键盘自动输入(tkinter 可视化版,模拟按键,带倒计时)
+
+依赖:pip install keyboard
+
+使用:
+1. 运行后弹出一个窗口。
+2. 点「浏览...」选择一个文本文件(自动兼容 UTF-8 / GBK 编码)。
+   文本只存到内存,不在界面上渲染,所以大文件(如几十 KB 的 base64)也不会卡。
+3. 可调整倒计时秒数和速度(WPM)。
+4. 点「开始」或按快捷键 Ctrl+Alt+T 激活。
+5. 在倒计时结束前,把光标点到目标输入框(可切到别的窗口)。
+6. 倒计时结束自动模拟按键输入。
+7. 期间随时可点「停止」中止;关窗口退出。
+
+⚠️ 模拟按键打的是物理按键,英文/数字/符号没问题;中文需要目标环境有中文输入法。
+   不使用剪贴板,适合沙箱等无剪贴板环境。
+"""
+
+import queue
+import random
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, ttk
+
+import keyboard
+
+
+class AutoTyperApp:
+    def __init__(self, root):
+        self.root = root
+        self.queue = queue.Queue()         # keyboard 后台线程 -> 主线程的通信队列
+        self.counting = False              # 是否正在倒计时
+        self.after_id = None               # 倒计时定时器 ID,用于取消
+        self.typing = False                # 是否正在逐字输入(用于停止)
+        self.stop_requested = False        # 输入线程每次循环检查,置位即停
+        self.text_content = ""             # 待输入文本(只存变量,不进 UI 渲染)
+        self.text_path = ""                # 当前文本来源文件路径
+
+        self._build_ui()
+        self._register_hotkey()
+        self._poll_queue()                 # 主线程轮询队列
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
 
 
