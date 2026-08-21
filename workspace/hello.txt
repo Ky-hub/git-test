@@ -1,5 +1,5 @@
 
-
+调用 addMessage, 参数: {"biz_id": "", "biz_type": "conversation", "content": "", "id": "", "model_id": "", "rating_id": "", "score": "", "sender": "", "sender_type": "user", "session_id": "", "voice_id": "2090629776175218690"}
 # -*- coding: utf-8 -*-
 """
 Windows 键盘自动输入(tkinter 可视化版,模拟按键,带倒计时)
